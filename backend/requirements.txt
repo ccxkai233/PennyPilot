@@ -1,0 +1,15 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+SQLAlchemy==2.0.43
+psycopg[binary]==3.2.9
+alembic==1.16.4
+pydantic-settings==2.10.1
+passlib[bcrypt]==1.7.4
+# passlib 1.7.4 is incompatible with bcrypt 4.1+ (and bcrypt 5 raises even
+# for normal passwords during passlib's backend self-test).
+bcrypt==4.0.1
+# Used by the AI-compatible HTTP client and authenticated per-user key
+# encryption.  Keys are encrypted with a Fernet key derived from the app
+# secret; they are never returned by the API.
+httpx==0.28.1
+cryptography==44.0.1

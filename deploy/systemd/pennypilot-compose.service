@@ -1,0 +1,16 @@
+[Unit]
+Description=PennyPilot Docker Compose application
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/PennyPilot
+ExecStart=/usr/bin/docker compose --env-file /etc/pennypilot/compose.env up -d --wait --wait-timeout 180
+ExecStop=/usr/bin/docker compose --env-file /etc/pennypilot/compose.env stop
+RemainAfterExit=yes
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

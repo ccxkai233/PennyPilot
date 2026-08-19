@@ -1,0 +1,9 @@
+PennyPilot database migrations
+
+Run from the backend directory:
+
+    alembic upgrade head
+
+Generate a migration after changing SQLAlchemy models:
+
+    alembic revision --autogenerate -m "describe the change"

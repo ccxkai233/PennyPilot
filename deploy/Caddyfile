@@ -1,0 +1,33 @@
+# PennyPilot production site.
+#
+# This is a site block to append/import into the host Caddyfile.  It does not
+# replace unrelated sites (for example api.gitdo.cc).  Caddy obtains and
+# renews the certificate for ledger.gitdo.net automatically when DNS points to
+# this host and ports 80/443 are reachable from the Internet.
+ledger.gitdo.net {
+    encode zstd gzip
+
+    # Keep the browser-facing security policy at the TLS edge.  HSTS is safe
+    # here because Caddy serves this hostname over HTTPS and redirects HTTP.
+    header {
+        -Server
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(), geolocation=(), microphone=()"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    }
+
+    # API and database-aware health checks go straight to FastAPI.  The
+    # explicit /api matcher also covers /api without a trailing slash.
+    @backend path /api /api/* /health
+    handle @backend {
+        reverse_proxy 127.0.0.1:8000
+    }
+
+    # Everything else is the Vue SPA served by nginx.  Its try_files fallback
+    # handles client-side routes such as /transactions and /settings.
+    handle {
+        reverse_proxy 127.0.0.1:8080
+    }
+}

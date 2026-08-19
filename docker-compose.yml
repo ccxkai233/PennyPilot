@@ -1,0 +1,115 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: pennypilot-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pennypilot}
+      POSTGRES_USER: ${POSTGRES_USER:-pennypilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pennypilot_dev_password}
+    ports:
+      # PostgreSQL is never exposed to the public network.  Keep the host
+      # binding for local administration/backups, but restrict it to loopback.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pennypilot} -d ${POSTGRES_DB:-pennypilot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pennypilot-backend
+    restart: unless-stopped
+    # The URL deliberately uses the Compose service name.  A host-oriented
+    # PENNYPILOT_DATABASE_URL in .env (localhost) must not leak into a
+    # container, where localhost would refer to the backend itself.
+    environment:
+      PENNYPILOT_DATABASE_URL: ${PENNYPILOT_CONTAINER_DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-pennypilot}:${POSTGRES_PASSWORD:-pennypilot_dev_password}@db:5432/${POSTGRES_DB:-pennypilot}}
+      # Keep container-level logs and any OS-local tooling on the same
+      # operator-facing timezone as the bookkeeping business day.  Database
+      # timestamps remain UTC instants; application code performs explicit
+      # Asia/Shanghai boundary conversion.
+      TZ: ${PENNYPILOT_TIMEZONE:-Asia/Shanghai}
+      PENNYPILOT_SECRET_KEY: ${PENNYPILOT_SECRET_KEY:-change-me-in-production}
+      PENNYPILOT_APP_ENV: ${PENNYPILOT_APP_ENV:-production}
+      PENNYPILOT_LOG_LEVEL: ${PENNYPILOT_LOG_LEVEL:-INFO}
+      PENNYPILOT_COOKIE_NAME: ${PENNYPILOT_COOKIE_NAME:-pennypilot_session}
+      PENNYPILOT_COOKIE_SECURE: ${PENNYPILOT_COOKIE_SECURE:-true}
+      PENNYPILOT_COOKIE_SAMESITE: ${PENNYPILOT_COOKIE_SAMESITE:-lax}
+      PENNYPILOT_CORS_ORIGINS: ${PENNYPILOT_CORS_ORIGINS:-https://ledger.gitdo.net}
+      PENNYPILOT_SESSION_TTL_DAYS: ${PENNYPILOT_SESSION_TTL_DAYS:-7}
+      PENNYPILOT_TRUSTED_HOSTS: ${PENNYPILOT_TRUSTED_HOSTS:-ledger.gitdo.net,localhost,127.0.0.1}
+      PENNYPILOT_TRUSTED_PROXY_IPS: ${PENNYPILOT_TRUSTED_PROXY_IPS:-127.0.0.1,::1}
+      PENNYPILOT_LOGIN_RATE_LIMIT: ${PENNYPILOT_LOGIN_RATE_LIMIT:-5}
+      PENNYPILOT_LOGIN_RATE_WINDOW_SECONDS: ${PENNYPILOT_LOGIN_RATE_WINDOW_SECONDS:-60}
+      PENNYPILOT_LOGIN_BLOCK_SECONDS: ${PENNYPILOT_LOGIN_BLOCK_SECONDS:-300}
+      # AI provider settings are optional.  A per-user encrypted key saved in
+      # the web UI takes precedence over these installation-wide defaults.
+      PENNYPILOT_AI_ENABLED: ${PENNYPILOT_AI_ENABLED:-true}
+      PENNYPILOT_AI_BASE_URL: ${PENNYPILOT_AI_BASE_URL:-https://api.openai.com}
+      PENNYPILOT_AI_MODEL: ${PENNYPILOT_AI_MODEL:-gpt-4o-mini}
+      PENNYPILOT_AI_API_KEY: ${PENNYPILOT_AI_API_KEY:-${OPENAI_API_KEY:-}}
+      PENNYPILOT_AI_FALLBACK_BASE_URL: ${PENNYPILOT_AI_FALLBACK_BASE_URL:-${PENNYPILOT_AI_BASE_URL:-https://api.openai.com}}
+      PENNYPILOT_AI_FALLBACK_MODEL: ${PENNYPILOT_AI_FALLBACK_MODEL:-gpt-4o-mini}
+      PENNYPILOT_AI_FALLBACK_API_KEY: ${PENNYPILOT_AI_FALLBACK_API_KEY:-${PENNYPILOT_AI_API_KEY:-${OPENAI_API_KEY:-}}}
+      PENNYPILOT_AI_TIMEOUT_SECONDS: ${PENNYPILOT_AI_TIMEOUT_SECONDS:-15}
+      PENNYPILOT_AI_MAX_RESPONSE_BYTES: ${PENNYPILOT_AI_MAX_RESPONSE_BYTES:-262144}
+      # Natural-language understanding is delegated to the configured model
+      # channels.  A local rules parser is opt-in for development only.
+      PENNYPILOT_AI_LOCAL_FALLBACK: ${PENNYPILOT_AI_LOCAL_FALLBACK:-false}
+      # Keep the legacy name available for existing deployments and tooling.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ports:
+      # Caddy on the host proxies /api and /health to this loopback port.
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --log-level ${PENNYPILOT_LOG_LEVEL:-info}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Empty means same-origin requests, which is the production default:
+        # Caddy sends /api to backend and all other paths to this service.
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+    container_name: pennypilot-frontend
+    restart: unless-stopped
+    ports:
+      # Caddy on the host proxies the public HTTPS site to this loopback port.
+      - "127.0.0.1:${FRONTEND_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+volumes:
+  postgres_data:

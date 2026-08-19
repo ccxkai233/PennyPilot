@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily PennyPilot settlement timer
+
+[Timer]
+# The product's natural-day boundary is Beijing time (Asia/Shanghai, UTC+8).
+# Operators can override this
+# calendar expression with `systemctl edit pennypilot-settlement.timer` while
+# retaining the same idempotent previous-day job.
+OnCalendar=*-*-* 00:30:00 Asia/Shanghai
+AccuracySec=1min
+Persistent=true
+Unit=pennypilot-settlement.service
+
+[Install]
+WantedBy=timers.target

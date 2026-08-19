@@ -1,0 +1,17 @@
+[Unit]
+Description=PennyPilot daily settlement
+Requires=docker.service pennypilot-compose.service
+After=docker.service pennypilot-compose.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/root/PennyPilot
+# Keep the compose environment in the root-owned, mode-0600 deployment file;
+# the job itself runs inside the already health-checked backend container.
+ExecStart=/usr/bin/docker compose --env-file /etc/pennypilot/compose.env exec -T backend python -m app.settlement_job --previous-day
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target
