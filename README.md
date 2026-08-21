@@ -115,6 +115,18 @@ curl http://127.0.0.1:8080/healthz
 
 后端容器启动时会先执行 `alembic upgrade head`，成功后才启动 Uvicorn；因此首次启动或升级时无需手动进入容器迁移。`postgres_data` 卷会保留现有数据，不要使用 `down -v`，除非明确要删除数据库。
 
+### AI 配置与容器重建
+
+用户在网页“设置”中保存的 AI 主通道和备用通道配置（接口地址、模型及 API Key）存放在 PostgreSQL 的 `ai_configs` 表中，不存放在前端容器文件系统里。只要保留 `postgres_data` 数据卷，重新构建或替换前后端容器不会清空这些配置。
+
+API Key 在数据库中以密文保存，密钥加密依赖 `PENNYPILOT_SECRET_KEY`。因此每次启动、升级或重建生产容器，都必须使用同一个环境文件：
+
+```bash
+docker compose --env-file /etc/pennypilot/compose.env up -d --build --wait --wait-timeout 180
+```
+
+不要直接运行不带 `--env-file` 的生产 Compose 命令，否则可能加载默认配置，导致无法解密已有 API Key 或使后端拒绝启动。除非已经完成密钥轮换和数据迁移，否则不要修改 `PENNYPILOT_SECRET_KEY`；`docker compose down -v` 也会删除数据库中的用户配置。
+
 ### 3. 配置 Caddy HTTPS
 
 仓库提供了独立站点片段 [deploy/Caddyfile](deploy/Caddyfile)，只包含 `ledger.gitdo.net`，不会覆盖已有站点。确认 DNS 的 A 记录已经指向本机，并确保防火墙放行 TCP 80/443 后，将它导入宿主机 Caddy 主配置（推荐使用 `import`）：
@@ -225,7 +237,7 @@ AI 配置使用 `GET/PUT (或 PATCH) /api/ai/config`，API Key 以 Fernet 密文
 `POST /api/settlements/recalculate`。普通生成不会覆盖已有快照；重算请求从指定日期更新已有快照并保留
 `is_recalculated`/`recalculated_at` 审计标记，同时补齐请求范围内缺失的日期（单次最多 3660 天）。快照中的往来余额按流水发生时间（UTC instant）重放，但日期边界采用北京时间，支持历史补录和冲销。
 
-所有新增迁移由容器启动时执行 `alembic upgrade head`，当前 head 为 `20260805_0006_partner_website`。
+所有新增迁移由容器启动时执行 `alembic upgrade head`，当前 head 为 `20260819_0010_feedback`。
 
 ## 停止与清理
 
