@@ -245,3 +245,27 @@ class DailySnapshot(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class Feedback(Base):
+    """A free-form feedback/bug-report entry submitted by a user.
+
+    Feedback is append-only: users can submit and review their own
+    submissions from anywhere in the app, but there is no update/delete
+    endpoint, so the history a user sees always matches what was sent.
+    """
+
+    __tablename__ = "feedback"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    category: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="other", server_default="other", index=True
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    contact: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )

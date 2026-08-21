@@ -10,6 +10,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .accounting import router as accounting_router
 from .ai import router as ai_router
+from .feedback import router as feedback_router
 from .partners import router as partners_router
 from .settlements import router as settlements_router
 from .auth import (
@@ -92,6 +93,7 @@ app.include_router(accounting_router)
 app.include_router(partners_router)
 app.include_router(ai_router)
 app.include_router(settlements_router)
+app.include_router(feedback_router)
 
 
 DEFAULT_CATEGORIES = (

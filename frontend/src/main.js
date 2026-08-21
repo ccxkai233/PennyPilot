@@ -11,6 +11,7 @@ import Partners from './views/Partners.vue'
 import AiBookkeeping from './views/AiBookkeeping.vue'
 import Reports from './views/Reports.vue'
 import Settlements from './views/Settlements.vue'
+import Feedback from './views/Feedback.vue'
 import { authState, clearAuth, ensureAuthenticated } from './stores/auth'
 
 const router = createRouter({
@@ -26,6 +27,7 @@ const router = createRouter({
     { path: '/ai', name: 'ai', component: AiBookkeeping, meta: { requiresAuth: true } },
     { path: '/settlements', name: 'settlements', component: Settlements, meta: { requiresAuth: true } },
     { path: '/reports', name: 'reports', component: Reports, meta: { requiresAuth: true } },
+    { path: '/feedback', name: 'feedback', component: Feedback, meta: { requiresAuth: true } },
     { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
   ],
 })

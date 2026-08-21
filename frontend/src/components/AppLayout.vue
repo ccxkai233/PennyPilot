@@ -65,6 +65,7 @@ const navItems = [
   { to: '/partners', label: '往来账户', icon: '♧' },
   { to: '/settlements', label: '日结', icon: '▣' },
   { to: '/reports', label: '财务分析', icon: '▥' },
+  { to: '/feedback', label: '意见反馈', icon: '✉' },
 ]
 const avatarLetter = computed(() => String(authState.user?.username || '我').slice(0, 1).toUpperCase())
 

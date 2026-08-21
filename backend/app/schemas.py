@@ -311,3 +311,40 @@ class TransactionListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+# ---------------------------------------------------------------------------
+# Feedback schemas
+# ---------------------------------------------------------------------------
+
+FeedbackCategory = Literal["bug", "suggestion", "other"]
+
+
+class FeedbackCreate(BaseModel):
+    category: FeedbackCategory = "other"
+    content: str = Field(min_length=1, max_length=2000)
+    contact: str | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def trim_fields(self):
+        self.content = self.content.strip()
+        if not self.content:
+            raise ValueError("content must not be blank")
+        if self.contact is not None:
+            self.contact = self.contact.strip() or None
+        return self
+
+
+class FeedbackRead(_ORMModel):
+    id: int
+    category: FeedbackCategory
+    content: str
+    contact: str | None = None
+    created_at: datetime
+
+
+class FeedbackListResponse(BaseModel):
+    items: list[FeedbackRead]
+    total: int
+    page: int
+    page_size: int

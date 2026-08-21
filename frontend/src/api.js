@@ -576,3 +576,9 @@ export const settlementsApi = {
   run: (data = {}) => apiFetch('/api/settlements/run', { method: 'POST', body: data }),
   recalculate: (data) => apiFetch('/api/settlements/recalculate', { method: 'POST', body: data }),
 }
+
+/** User-submitted feedback: append-only, scoped to the current user. */
+export const feedbackApi = {
+  list: (filters = {}) => apiFetch(`/api/feedback${queryString(filters)}`).then(listPayload),
+  create: (data) => apiFetch('/api/feedback', { method: 'POST', body: data }),
+}
