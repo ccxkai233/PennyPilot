@@ -245,6 +245,7 @@ def test_model_parse_discards_untrusted_field_status_and_recomputes_missing(monk
     assert "不要求用户使用‘备注/说明/用途’等关键词" in captured["system"]
     assert "notes=null 不属于必填缺失字段" in captured["system"]
     assert "若 notes=null，必须在 brief_comment 中顺带礼貌询问" in captured["system"]
+    assert "notes=‘两颗卤蛋’，不能只写‘卤蛋’" in captured["system"]
 
 
 def test_model_parse_uses_bounded_multiturn_context_and_returns_one_comment(monkeypatch):
