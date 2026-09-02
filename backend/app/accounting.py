@@ -31,6 +31,7 @@ from .schemas import (
     TransactionCreate,
     TransactionListResponse,
     TransactionRead,
+    TransactionTotalsResponse,
     TransactionUpdate,
     TransactionVoidRequest,
 )
@@ -516,6 +517,41 @@ def list_transactions(
         for tx, category_name, method_name, transfer_method_name, partner_name in rows
     ]
     return TransactionListResponse(items=items, total=total, page=page, page_size=page_size)
+
+
+def _cashflow_totals(db: Session, user_id: int) -> TransactionTotalsResponse:
+    """All-time income/expense totals; voided entries and transfers excluded."""
+
+    rows = db.execute(
+        select(
+            Transaction.direction,
+            func.count(Transaction.id),
+            func.coalesce(func.sum(Transaction.amount_cents), 0),
+        )
+        .where(
+            Transaction.user_id == user_id,
+            Transaction.status == "normal",
+            Transaction.kind == "cashflow",
+        )
+        .group_by(Transaction.direction)
+    ).all()
+    totals = {direction: (int(count), int(amount)) for direction, count, amount in rows}
+    income_count, income_cents = totals.get("income", (0, 0))
+    expense_count, expense_cents = totals.get("expense", (0, 0))
+    return TransactionTotalsResponse(
+        income_cents=income_cents,
+        expense_cents=expense_cents,
+        income_count=income_count,
+        expense_count=expense_count,
+    )
+
+
+# Registered before ``/transactions/{transaction_id}`` so the literal
+# ``summary`` segment is not captured as a transaction id.
+@router.get("/transactions/summary", response_model=TransactionTotalsResponse)
+def transactions_summary(request: Request, db: Session = Depends(get_db)):
+    user = _user(request, db)
+    return _cashflow_totals(db, user.id)
 
 
 @router.get("/transactions/{transaction_id}", response_model=TransactionRead)

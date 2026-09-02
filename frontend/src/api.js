@@ -431,6 +431,7 @@ export const transactionsApi = {
     const suffix = query.toString() ? `?${query.toString()}` : ''
     return apiFetch(`/api/transactions${suffix}`).then(listPayload)
   },
+  summary: () => apiFetch('/api/transactions/summary'),
   create: (data) => apiFetch('/api/transactions', { method: 'POST', body: data }),
   update: (id, data) => apiFetch(`/api/transactions/${id}`, { method: 'PATCH', body: data }),
   voidTransaction: (id, reason = null) => apiFetch(`/api/transactions/${id}/void`, {

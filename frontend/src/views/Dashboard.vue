@@ -1,7 +1,7 @@
 <template>
   <AppLayout title="概览" :subtitle="todayLabel" :notice="notice">
     <template v-if="!isMobile" #actions><router-link class="primary quick-link" to="/ai">＋ 记一笔</router-link></template>
-    <MobileDashboard v-if="isMobile" :summary="summary" :today-summary="todaySummary" :recent="recent" :loading="loading" :error-message="errorMessage" :account-balances="accountBalances" :account-balance-groups="accountBalanceGroups" :category-name="categoryName" :payment-method-name="paymentMethodName" :transaction-note="transactionNote" :transaction-full-note="transactionFullNote" :cents="cents" :is-voided="isVoided" @retry="load" />
+    <MobileDashboard v-if="isMobile" :summary="summary" :today-summary="todaySummary" :overall-summary="overallSummary" :total-assets="totalAssets" :recent="recent" :loading="loading" :error-message="errorMessage" :account-balances="accountBalances" :account-balance-groups="accountBalanceGroups" :category-name="categoryName" :payment-method-name="paymentMethodName" :transaction-note="transactionNote" :transaction-full-note="transactionFullNote" :cents="cents" :is-voided="isVoided" @retry="load" />
     <template v-else>
     <div class="summary-groups">
       <div class="cards">
@@ -42,6 +42,11 @@
         </table>
       </div>
     </section>
+    <div class="cards overall-cards">
+      <div class="card"><span>总收入</span><strong class="income-text">{{ formatMoney(overallSummary.income) }}</strong><em class="up">{{ overallSummary.incomeCount }} 笔收入</em></div>
+      <div class="card"><span>总支出</span><strong class="expense-text">{{ formatMoney(overallSummary.expense) }}</strong><em class="down">{{ overallSummary.expenseCount }} 笔支出</em></div>
+      <div class="card"><span>总资产</span><strong :class="totalAssets >= 0 ? 'income-text' : 'expense-text'">{{ formatMoney(totalAssets) }}</strong><em>现金 + 投资 − 负债</em></div>
+    </div>
     </template>
   </AppLayout>
 </template>
@@ -57,6 +62,7 @@ import { ApiError, beijingDateIso, categoriesApi, formatDateTime, formatMoney, p
 const loading = ref(false)
 const errorMessage = ref('')
 const monthTransactions = ref([])
+const overallTotals = ref(null)
 const categories = ref([])
 const paymentMethods = ref([])
 const notice = ref(null)
@@ -81,6 +87,18 @@ const accountBalanceGroups = computed(() => groupAccounts(accountBalances.value)
   ...group,
   total_cents: group.items.reduce((total, account) => total + (Number.isFinite(account.balance_cents) ? account.balance_cents : 0), 0),
 })))
+const overallSummary = computed(() => ({
+  income: Number(overallTotals.value?.income_cents) || 0,
+  expense: Number(overallTotals.value?.expense_cents) || 0,
+  incomeCount: Number(overallTotals.value?.income_count) || 0,
+  expenseCount: Number(overallTotals.value?.expense_count) || 0,
+}))
+// Net assets: cash and investment balances count in, liability balances
+// (stored as a positive amount owed) count against.
+const totalAssets = computed(() => accountBalanceGroups.value.reduce(
+  (total, group) => total + (group.role === 'liability' ? -group.total_cents : group.total_cents),
+  0,
+))
 function summarizeTransactions(items) {
   const active = items.filter((item) => !isVoided(item))
   const incomeItems = active.filter((item) => item.direction === 'income')
@@ -117,12 +135,16 @@ async function loadMonthTransactions() {
 async function load() {
   loading.value = true; errorMessage.value = ''
   try {
-    const [rows, categoryResult, methodResult] = await Promise.all([
+    const [rows, categoryResult, methodResult, totalsResult] = await Promise.all([
       loadMonthTransactions(),
       categoriesApi.list(),
       paymentMethodsApi.list(),
+      // Older backends may not expose the totals endpoint yet; the bottom
+      // summary then simply shows zeros instead of failing the whole page.
+      transactionsApi.summary().catch(() => null),
     ])
     summaryAsOf.value = Date.now()
+    overallTotals.value = totalsResult
     categories.value = categoryResult
     paymentMethods.value = methodResult
     monthTransactions.value = rows.map((item) => ({
@@ -179,5 +201,6 @@ onMounted(load)
   .recent-row{gap:8px}
   .recent-amount{max-width:92px;font-size:12px}
 }
+.overall-cards{margin:18px 0 32px}.overall-cards .card{border:1px solid #e8edf5}
 .investment-text{color:#567cc5!important}.balance-panel{overflow:hidden;margin-top:18px}.balance-table-wrap{overflow-x:auto}.balance-table{width:100%;border-collapse:collapse}.balance-table th{background:#fafbfd;color:#8d9aae;font-size:11px;font-weight:600;text-align:left;padding:11px 24px;white-space:nowrap}.balance-table td{border-top:1px solid #edf0f5;color:#59677d;font-size:12px;padding:13px 24px}.balance-table .account-group-row td{padding-top:10px;padding-bottom:10px;border-top:1px solid #e2e8f1;background:#f8fafc}.balance-table tbody:first-of-type .account-group-row td{border-top:0}.account-group-title{display:inline-flex;align-items:center;gap:8px}.account-group-title>span{display:grid;place-items:center;width:25px;height:25px;border-radius:8px;font-size:11px;font-weight:700}.group-cash .account-group-title>span{color:#16825d;background:#e7f8f0}.group-investment .account-group-title>span{color:#5672b5;background:#edf2ff}.group-liability .account-group-title>span{color:#bf5962;background:#fff0f0}.account-group-title strong{color:#405169;font-size:12px}.account-group-title small{color:#9aa6b7;font-size:10px}.account-group-total{font-size:11px;white-space:nowrap}.account-name{display:inline-flex;align-items:center;gap:9px}.account-name strong{color:#43536c}.account-icon{display:grid;place-items:center;width:29px;height:29px;border-radius:9px;background:#edf4ff;color:#2563eb;font-size:12px;font-weight:700}.role-badge{display:inline-flex;align-items:center;border-radius:99px;padding:5px 8px;font-size:10px}.role-cash{color:#16825d;background:#e7f8f0}.role-liability{color:#bf5962;background:#fff0f0}.role-investment{color:#5672b5;background:#edf2ff}.balance-value{font-size:13px;white-space:nowrap}
 </style>

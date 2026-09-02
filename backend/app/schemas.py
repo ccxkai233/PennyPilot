@@ -313,6 +313,15 @@ class TransactionListResponse(BaseModel):
     page_size: int
 
 
+class TransactionTotalsResponse(BaseModel):
+    """All-time cashflow totals (voided entries and transfers excluded)."""
+
+    income_cents: int
+    expense_cents: int
+    income_count: int
+    expense_count: int
+
+
 # ---------------------------------------------------------------------------
 # Feedback schemas
 # ---------------------------------------------------------------------------
