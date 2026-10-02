@@ -1653,3 +1653,71 @@ def test_ai_config_saves_and_reads_the_api_format(monkeypatch):
     assert (fallback.model, fallback.api_format) == ("claude-sonnet-4-6", "anthropic")
     with pytest.raises(ValidationError):
         ai_module.AIConfigUpdate(api_format="cohere")
+
+
+def _server_channel_service(share: bool) -> AIService:
+    return AIService(
+        Settings(
+            _env_file=None,
+            secret_key="s" * 64,
+            ai_base_url="https://owner-proxy.example",
+            ai_model="owner-model",
+            ai_api_key="sk-owner-1234",
+            ai_api_format="gemini",
+            ai_fallback_base_url="https://owner-fallback.example",
+            ai_fallback_model="owner-fallback-model",
+            ai_fallback_api_key="sk-owner-fallback-5678",
+            ai_share_with_users=share,
+            # As in production: no silent local parser when no channel answers.
+            ai_local_fallback=False,
+        )
+    )
+
+
+def test_server_ai_channel_is_shared_with_users_by_default():
+    db = _db()
+    user, _, _, _ = _fixtures(db)
+
+    primary, fallback = _server_channel_service(True).provider_chain_for_user(db, user.id)
+
+    assert (primary.base_url, primary.model, primary.api_key, primary.api_format) == ("https://owner-proxy.example", "owner-model", "sk-owner-1234", "gemini")
+    assert (fallback.base_url, fallback.api_key) == ("https://owner-fallback.example", "sk-owner-fallback-5678")
+
+
+def test_unshared_server_ai_channel_is_hidden_from_users_without_their_own(monkeypatch):
+    db = _db()
+    user, _, _, _ = _fixtures(db)
+    service = _server_channel_service(False)
+    monkeypatch.setattr(ai_module, "service", service)
+    monkeypatch.setattr(ai_module, "_user", lambda request, session: user)
+
+    providers = service.provider_chain_for_user(db, user.id)
+
+    assert len(providers) == 1
+    assert (providers[0].base_url, providers[0].model, providers[0].api_key, providers[0].api_format) == ("https://api.openai.com", "gpt-4o-mini", None, "openai")
+    # Nothing about the owner's channel shows up in the settings form either.
+    config = ai_module.get_ai_config(None, db)
+    assert config.configured is False and config.fallback_configured is False
+    assert config.api_key_hint is None and config.fallback_api_key_hint is None
+    assert "owner" not in config.model_dump_json()
+    # AI requests stop instead of spending the owner's quota.
+    with pytest.raises(HTTPException) as error:
+        ai_module.parse_natural_language(ai_module.AIParseRequest(text="午餐35元"), None, db)
+    assert error.value.status_code == 503
+    assert error.value.detail == "AI 服务未配置，请先完成 AI 配置。"
+
+
+def test_unshared_server_ai_channel_never_fills_in_a_users_missing_fields(monkeypatch):
+    db = _db()
+    user, _, _, _ = _fixtures(db)
+    service = _server_channel_service(False)
+    monkeypatch.setattr(ai_module, "service", service)
+    monkeypatch.setattr(ai_module, "_user", lambda request, session: user)
+
+    # The user saves only a key and a model, leaving the address blank.
+    ai_module.put_ai_config(ai_module.AIConfigUpdate(model="my-model", api_key="sk-mine-0000"), None, db)
+    providers = service.provider_chain_for_user(db, user.id)
+
+    assert (providers[0].base_url, providers[0].model, providers[0].api_key) == ("https://api.openai.com", "my-model", "sk-mine-0000")
+    assert all("owner" not in (item.base_url + item.model + (item.api_key or "")) for item in providers)
+    assert ai_module.get_ai_config(None, db).api_key_hint == "••••0000"

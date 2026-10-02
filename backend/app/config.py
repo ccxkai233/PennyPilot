@@ -180,6 +180,13 @@ class Settings(BaseSettings):
         default=True,
         validation_alias=AliasChoices("PENNYPILOT_AI_ENABLED", "AI_ENABLED"),
     )
+    # Whether users without a channel of their own may use the server's AI
+    # address, model and key.  Anyone can register, so a public deployment
+    # turns this off and each user configures a channel in the settings page.
+    ai_share_with_users: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("PENNYPILOT_AI_SHARE_WITH_USERS", "AI_SHARE_WITH_USERS"),
+    )
     # Development can opt into the deterministic parser for diagnostics. In
     # production we disable it so a provider outage is never mistaken for an
     # AI decision.

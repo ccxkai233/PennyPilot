@@ -243,6 +243,10 @@ AI 配置使用 `GET/PUT (或 PATCH) /api/ai/config`，API Key 以 Fernet 密文
 
 接口地址只需填到主机（末尾带 `/v1` 也可以），后端会按格式拼接路径；三种格式都以流式方式调用，思考内容会显示在 AI 记账页的思考面板里。
 
+注册是开放的，所以服务器环境变量里的 AI 接口（地址、模型、Key）默认不对用户开放：`PENNYPILOT_AI_SHARE_WITH_USERS=false`（生产 Compose 的默认值）时，
+没有自行配置的用户看不到也用不了服务器的接口，AI 功能会提示先完成配置；只填了 Key 没填地址的用户使用公共默认地址 `https://api.openai.com`。
+单人自用或本地开发可以设为 `true`，让所有用户共用服务器配置的接口。
+
 `POST /api/ai/parse-stream` 与 `/api/ai/parse` 的请求体相同，但以 SSE（`text/event-stream`）返回解析过程：
 `provider`（开始使用主/备用通道）、`reasoning`（模型的思考摘要增量）、`content`（草稿 JSON 增量）、`status`（复核、切换通道等），
 最后一条一定是 `result`（与 `/parse` 相同的解析结果）或 `error`。解析请求对模型使用流式输出，读取超时只限制相邻两段输出的间隔（30 秒），

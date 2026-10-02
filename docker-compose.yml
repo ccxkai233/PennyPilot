@@ -65,6 +65,9 @@ services:
       # Natural-language understanding is delegated to the configured model
       # channels.  A local rules parser is opt-in for development only.
       PENNYPILOT_AI_LOCAL_FALLBACK: ${PENNYPILOT_AI_LOCAL_FALLBACK:-false}
+      # Registration is open, so users must not inherit the server's AI
+      # address and key; each user configures a channel in the settings page.
+      PENNYPILOT_AI_SHARE_WITH_USERS: ${PENNYPILOT_AI_SHARE_WITH_USERS:-false}
       # Keep the legacy name available for existing deployments and tooling.
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     ports:

@@ -87,9 +87,9 @@ def _config_response(db: Session, user_id: int) -> AIConfigRead:
     user_api_key = decrypt_api_key(getattr(row, "encrypted_api_key", None), service.settings) if row else None
     fallback_api_key = decrypt_api_key(getattr(row, "encrypted_fallback_api_key", None), service.settings) if row else None
     if not user_api_key:
-        user_api_key = service.settings.ai_api_key
+        user_api_key = service.server_default("ai_api_key")
     if not fallback_api_key:
-        fallback_api_key = service.settings.ai_fallback_api_key or (fallback_provider.api_key if fallback_provider else None)
+        fallback_api_key = service.server_default("ai_fallback_api_key") or (fallback_provider.api_key if fallback_provider else None)
     return AIConfigRead(
         configured=provider.configured,
         base_url=provider.base_url,
@@ -97,8 +97,8 @@ def _config_response(db: Session, user_id: int) -> AIConfigRead:
         api_key_set=provider.configured,
         api_key_hint=service.key_hint(user_api_key),
         fallback_configured=bool(fallback_api_key),
-        fallback_base_url=getattr(row, "fallback_base_url", None) or service.settings.ai_fallback_base_url or (fallback_provider.base_url if fallback_provider else provider.base_url),
-        fallback_model=getattr(row, "fallback_model", None) or service.settings.ai_fallback_model or (fallback_provider.model if fallback_provider else provider.model),
+        fallback_base_url=getattr(row, "fallback_base_url", None) or service.server_default("ai_fallback_base_url") or (fallback_provider.base_url if fallback_provider else provider.base_url),
+        fallback_model=getattr(row, "fallback_model", None) or service.server_default("ai_fallback_model") or (fallback_provider.model if fallback_provider else provider.model),
         fallback_api_key_set=bool(fallback_api_key),
         fallback_api_key_hint=service.key_hint(fallback_api_key),
         api_format=provider.api_format,

@@ -55,6 +55,10 @@ ANTHROPIC_MAX_TOKENS = 16_000
 DEEPSEEK_READ_TIMEOUT_SECONDS = 30.0
 DEEPSEEK_CONNECT_TIMEOUT_SECONDS = 10.0
 
+# Neutral channel defaults for users who may not see the server's own channel.
+PUBLIC_AI_BASE_URL: str = Settings.model_fields["ai_base_url"].default
+PUBLIC_AI_MODEL: str = Settings.model_fields["ai_model"].default
+
 logger = logging.getLogger(__name__)
 
 
@@ -621,8 +625,19 @@ class AIService:
         except SQLAlchemyError:
             return None
 
+    def server_default(self, name: str) -> Any:
+        """A deployment-level AI setting, or ``None`` when it is not shared.
+
+        The server's own channel (address, model, key) belongs to whoever
+        runs the deployment.  With sharing off, a user's missing fields are
+        never filled in from it.
+        """
+
+        return getattr(self.settings, name) if self.settings.ai_share_with_users else None
+
     def provider_for_user(self, db: Session, user_id: int) -> Provider:
-        base_url, model, key = self.settings.ai_base_url, self.settings.ai_model, self.settings.ai_api_key
+        default_base_url = self.server_default("ai_base_url") or PUBLIC_AI_BASE_URL
+        base_url, model, key = default_base_url, self.server_default("ai_model") or PUBLIC_AI_MODEL, self.server_default("ai_api_key")
         row = self._config_row_for_user(db, user_id)
         if row:
             base_url = row.base_url or base_url
@@ -631,21 +646,21 @@ class AIService:
         try:
             base_url = _validated_base_url(base_url)
         except AIServiceError:
-            base_url = self.settings.ai_base_url
-        api_format = getattr(row, "api_format", None) or self.settings.ai_api_format
+            base_url = default_base_url
+        api_format = getattr(row, "api_format", None) or self.server_default("ai_api_format") or "openai"
         return Provider(name="primary", base_url=base_url, api_key=(key or None), model=model.strip(), api_format=api_format)
 
     def fallback_api_format(self, row: AIConfig | None) -> str:
-        return getattr(row, "fallback_api_format", None) or self.settings.ai_fallback_api_format or "openai"
+        return getattr(row, "fallback_api_format", None) or self.server_default("ai_fallback_api_format") or "openai"
 
     def provider_chain_for_user(self, db: Session, user_id: int) -> list[Provider]:
         primary = self.provider_for_user(db, user_id)
         row = self._config_row_for_user(db, user_id)
-        fallback_base_url = getattr(row, "fallback_base_url", None) or self.settings.ai_fallback_base_url or primary.base_url
-        fallback_model = getattr(row, "fallback_model", None) or self.settings.ai_fallback_model or primary.model
+        fallback_base_url = getattr(row, "fallback_base_url", None) or self.server_default("ai_fallback_base_url") or primary.base_url
+        fallback_model = getattr(row, "fallback_model", None) or self.server_default("ai_fallback_model") or primary.model
         fallback_api_key = (
             decrypt_api_key(getattr(row, "encrypted_fallback_api_key", None), self.settings)
-            or self.settings.ai_fallback_api_key
+            or self.server_default("ai_fallback_api_key")
             or primary.api_key
         )
         try:
