@@ -228,7 +228,15 @@ scripts/restore_postgres.sh /var/backups/pennypilot/<备份文件>.dump --confir
 
 AI 配置使用 `GET/PUT (或 PATCH) /api/ai/config`，API Key 以 Fernet 密文保存且不会在响应中返回。
 `POST /api/ai/parse` 只生成解析草稿，`POST /api/ai/confirm` 要求请求体中的 `confirm: true`，
-并在字段校验通过后才写入交易；可选的往来流水也会与交易原子提交。无可用模型或模型响应不符合
+并在字段校验通过后才写入交易；可选的往来流水也会与交易原子提交。一句话里包含多笔记录时（例如一连串消费，
+或还款时用了还款券），解析结果的 `records` 会按顺序列出每一笔草稿（`parsed` 为第一笔），前端逐笔勾选后调用
+`POST /api/ai/confirm-batch`（`confirm: true` + `drafts`，最多 10 笔）在同一事务中写入，任何一笔校验失败则全部不入账；
+批量确认只支持现金收支和转账，往来未结算余额仍需单笔确认。
+
+`POST /api/ai/parse-stream` 与 `/api/ai/parse` 的请求体相同，但以 SSE（`text/event-stream`）返回解析过程：
+`provider`（开始使用主/备用通道）、`reasoning`（模型的思考摘要增量）、`content`（草稿 JSON 增量）、`status`（复核、切换通道等），
+最后一条一定是 `result`（与 `/parse` 相同的解析结果）或 `error`。解析请求对模型使用流式输出，读取超时只限制相邻两段输出的间隔（30 秒），
+单次请求总时长上限 90 秒；`gpt-6` 系列使用 `reasoning_effort=low`（该系列无法关闭推理）。无可用模型或模型响应不符合
 严格 schema 时，接口会返回带 warning 的本地规则草稿，不会自动入账。`POST /api/ai/analyze` 生成
 日/周/月/年/全部/自定义周期报告，`GET /api/ai/reports` 和 `/api/ai/reports/{id}` 用于历史回看。
 

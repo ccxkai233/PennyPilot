@@ -147,6 +147,22 @@ class AIParsedTransaction(BaseModel):
         return self
 
 
+# One message may describe several independent records (a run of purchases,
+# or a repayment plus the coupon that offset part of it).
+MAX_PARSE_RECORDS = 10
+
+
+class AIParsedRecord(BaseModel):
+    """One proposal of a multi-record parse, with its own completeness."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["complete", "need_more_info"]
+    parsed: AIParsedTransaction
+    missing_fields: list[str] = Field(default_factory=list, max_length=16)
+    follow_up_question: str | None = Field(default=None, max_length=1000)
+
+
 class AIParseResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -158,6 +174,10 @@ class AIParseResponse(BaseModel):
     brief_comment: str | None = Field(default=None, max_length=300)
     source: Literal["model", "fallback"]
     warning: str | None = Field(default=None, max_length=300)
+    # Populated only when the text describes more than one record.  It then
+    # lists every proposal in order and ``parsed`` repeats the first one, so
+    # single-record clients keep working unchanged.
+    records: list[AIParsedRecord] = Field(default_factory=list, max_length=MAX_PARSE_RECORDS)
 
     @field_validator("brief_comment", mode="before")
     @classmethod
@@ -233,6 +253,19 @@ class AIConfirmResponse(BaseModel):
     partner_ledger: dict | None = None
     balance_reconciliation: dict | None = None
     warning: str | None = None
+
+
+class AIBatchConfirmRequest(BaseModel):
+    """Confirm several cash/transfer proposals from one parse in a single write."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal[True]
+    drafts: list[AIParsedTransaction] = Field(min_length=1, max_length=MAX_PARSE_RECORDS)
+
+
+class AIBatchConfirmResponse(BaseModel):
+    transactions: list[dict]
 
 
 class AIAnalyzeRequest(BaseModel):

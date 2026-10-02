@@ -9,7 +9,7 @@
         <div>
           <p class="mobile-ai-eyebrow">AI 记账助手</p>
           <h2>说一句话，记账、查收支、要报告都可以</h2>
-          <p class="mobile-ai-help">AI 会自动判断现金收支、往来余额变化，或两者同时发生；也可以直接问本月、本年或全部的收支情况，或让它生成收支报告。</p>
+          <p class="mobile-ai-help">AI 会自动判断现金收支、往来余额变化，或两者同时发生；一句话里说了多笔，会拆成多条记录供你勾选。也可以直接问本月、本年或全部的收支情况，或让它生成收支报告。</p>
         </div>
       </div>
       <div class="mobile-ai-flow" aria-label="记账流程">
@@ -57,9 +57,10 @@
           :class="[message.role === 'user' ? 'is-user' : 'is-assistant', { 'is-chat': message.kind === 'chat' }]"
         >
           <span class="mobile-ai-avatar">{{ message.role === 'user' ? '我' : '✦' }}</span>
-          <div class="mobile-ai-bubble"><p>{{ message.content }}</p><router-link v-if="message.report_id" class="mobile-ai-message-link" :to="{ path: '/reports', query: { report: message.report_id } }">报告已保存，在财务分析中查看 →</router-link></div>
+          <AiThinkingPanel v-if="message.kind === 'thinking'" v-model:open="message.open" :entries="message.entries" :seconds="message.seconds" />
+          <div v-else class="mobile-ai-bubble"><p>{{ message.content }}</p><router-link v-if="message.report_id" class="mobile-ai-message-link" :to="{ path: '/reports', query: { report: message.report_id } }">报告已保存，在财务分析中查看 →</router-link></div>
         </div>
-        <div v-if="parsing" class="mobile-ai-message is-assistant mobile-ai-parsing-message"><span class="mobile-ai-avatar">✦</span><p><span class="mobile-ai-typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>{{ retryStatus || parsingLabel || '正在整理这笔记录，完成后向下核对' }} <span aria-hidden="true">↓</span></p></div>
+        <div v-if="parsing" class="mobile-ai-message is-assistant mobile-ai-parsing-message"><span class="mobile-ai-avatar">✦</span><AiThinkingPanel v-if="thinking.active" v-model:open="thinking.open" active :entries="thinking.entries" :seconds="thinking.seconds" :stage="retryStatus || thinking.stage" /><p v-else><span class="mobile-ai-typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>{{ retryStatus || parsingLabel || '正在整理这笔记录，完成后向下核对' }} <span aria-hidden="true">↓</span></p></div>
       </div>
     </section>
 
@@ -125,6 +126,49 @@
       </form>
     </section>
 
+    <section v-if="isBatchMode" class="mobile-ai-card mobile-ai-draft mobile-ai-batch">
+      <div class="mobile-ai-section-head">
+        <div>
+          <p class="mobile-ai-eyebrow">第 2 步 · 核对</p>
+          <h2>确认多笔记录</h2>
+        </div>
+        <span class="mobile-ai-status">已选 {{ batchSelectedCount }} / {{ batchDrafts.length }}</span>
+      </div>
+      <p class="mobile-ai-card-note">逐笔核对，勾选需要入账的记录后一次确认；未勾选的不会写入账本。</p>
+      <p class="mobile-ai-batch-progress" :class="{ 'is-ready': batchReady }" role="status">{{ batchProgress }}</p>
+      <form class="mobile-ai-draft-form" @submit.prevent="confirmBatch">
+        <article v-for="(item, index) in batchDrafts" :key="item.key" class="mobile-ai-batch-item" :class="{ 'is-skipped': !item.selected }">
+          <header class="mobile-ai-batch-head">
+            <label class="mobile-ai-batch-check"><input v-model="item.selected" type="checkbox" /><span>第 {{ index + 1 }} 笔</span></label>
+            <p class="mobile-ai-batch-summary">{{ batchDraftSummary(item) }}</p>
+            <p v-if="item.selected && batchDraftMissing(item).length" class="mobile-ai-batch-missing">还需补充：{{ batchDraftMissing(item).join('、') }}</p>
+          </header>
+          <div v-if="item.selected" class="mobile-ai-batch-fields">
+            <div class="mobile-ai-segmented is-three" role="group" :aria-label="`第 ${index + 1} 笔的类型`">
+              <button type="button" :class="{ selected: !isTransferItem(item) && item.direction === 'expense' }" @click="setBatchDraftType(item, 'expense')">现金流出</button>
+              <button type="button" :class="{ selected: !isTransferItem(item) && item.direction === 'income' }" @click="setBatchDraftType(item, 'income')">现金流入</button>
+              <button type="button" :class="{ selected: isTransferItem(item) }" @click="setBatchDraftType(item, 'transfer')">转账/还款</button>
+            </div>
+            <label>金额（元）<input v-model.trim="item.amount" inputmode="decimal" pattern="^[0-9]+([.][0-9]{1,2})?$" required /></label>
+            <label>发生时间<input v-model="item.occurred_at" type="datetime-local" required /></label>
+            <label v-if="!isTransferItem(item)">分类<select v-model="item.category_id" required><option value="" disabled>请选择分类</option><option v-for="category in categoriesForBatchDraft(item)" :key="category.id" :value="String(category.id)">{{ category.name }}</option></select></label>
+            <label>{{ isTransferItem(item) ? '来源账户' : item.direction === 'income' ? '收款账户' : '支付账户' }}<select v-model="item.payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="method in paymentMethods" :key="method.id" :value="String(method.id)">{{ paymentMethodOptionLabel(method) }}</option></select></label>
+            <label v-if="isTransferItem(item)">转入/还款账户<select v-model="item.transfer_payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="method in paymentMethods" :key="method.id" :value="String(method.id)">{{ paymentMethodOptionLabel(method) }}</option></select></label>
+            <label v-else-if="partners.length">关联客户/供应商（仅标签）<select v-model="item.partner_id"><option value="">不关联</option><option v-for="partner in partners" :key="partner.id" :value="String(partner.id)">{{ partner.name }}</option></select></label>
+            <label>备注<textarea v-model.trim="item.notes" rows="2" maxlength="500" placeholder="可填写补充说明"></textarea></label>
+          </div>
+        </article>
+        <p v-if="confirmError" class="mobile-ai-form-error" role="alert">{{ confirmError }}</p>
+        <div class="mobile-ai-form-actions">
+          <button class="mobile-ai-secondary" type="button" :disabled="confirming || parsing" @click="focusPrompt">继续让 AI 补充</button>
+          <button class="mobile-ai-primary" type="submit" :disabled="confirming || !batchReady">
+            <span v-if="confirming" class="mobile-ai-spinner"></span>{{ confirming ? '确认中…' : `确认所选 ${batchSelectedCount} 笔` }}
+          </button>
+        </div>
+        <button class="mobile-ai-reset-link" type="button" title="清空本轮对话和已解析草稿" :disabled="confirming || parsing" @click="resetConversation">清空对话与草稿</button>
+      </form>
+    </section>
+
     <section class="mobile-ai-card mobile-ai-composer" aria-label="发送记账描述">
       <form class="mobile-ai-prompt" @submit.prevent="submitPrompt">
         <label class="sr-only" for="mobile-ai-prompt-input">记账描述</label>
@@ -136,7 +180,7 @@
           rows="1"
           maxlength="1000"
           autocomplete="off"
-          placeholder="描述一笔收支或往来…"
+          placeholder="描述一笔或多笔收支、往来…"
           @input="emitPrompt"
           @keydown.enter.exact.prevent="submitPrompt"
         ></textarea>
@@ -185,6 +229,7 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
 import { amountToCents, formatDateTime, formatMoney } from '../api'
+import AiThinkingPanel from '../components/AiThinkingPanel.vue'
 
 const props = defineProps({
   prompt: { type: String, default: '' },
@@ -230,6 +275,16 @@ const props = defineProps({
   confirmDraft: { type: Function, required: true },
   loadHistory: { type: Function, required: true },
   partnerLedgerLabel: { type: Function, required: true },
+  batchDrafts: { type: Array, default: () => [] },
+  batchReady: { type: Boolean, default: false },
+  batchProgress: { type: String, default: '' },
+  batchSelectedCount: { type: Number, default: 0 },
+  batchDraftMissing: { type: Function, required: true },
+  batchDraftSummary: { type: Function, required: true },
+  setBatchDraftType: { type: Function, required: true },
+  categoriesForBatchDraft: { type: Function, required: true },
+  confirmBatch: { type: Function, required: true },
+  thinking: { type: Object, default: () => ({ active: false, open: true, stage: '', entries: [], seconds: 0 }) },
 })
 
 const emit = defineEmits(['update:prompt'])
@@ -238,6 +293,7 @@ const conversationThread = ref(null)
 const historyOpen = ref(false)
 const examples = [
   '午餐支出 35 元，微信支付',
+  '早餐微信 12 元，午饭支付宝 35 元，晚上打车现金 28 元',
   '收到客户货款 3500 元，支付宝',
   '客户王先生目前未结算余额 12000 元',
   '支付宝扫了 1000 元给供应商王先生，供应商网站现在余额 760 元',
@@ -259,6 +315,8 @@ const draftWarning = computed(() => {
 })
 const isPartnerMode = computed(() => props.mode === 'partner')
 const isTransferDraft = computed(() => String(props.draft?.kind || '').toLowerCase() === 'transfer')
+const isBatchMode = computed(() => props.batchDrafts.length > 1)
+function isTransferItem(item) { return String(item?.kind || '').toLowerCase() === 'transfer' }
 const isCombinedMode = computed(() => props.mode === 'combined' || props.combinedVisible)
 const currentPartner = computed(() => props.selectedPartner || props.partners.find((item) => String(item.id) === String(props.draft?.partner_id)) || null)
 const examplesForMode = computed(() => examples)
@@ -354,4 +412,6 @@ function historyStatusClass(item) { return String(item.status || '').toLowerCase
 .mobile-ai-combined-panel .mobile-ai-ledger-hint{margin:9px 0 0}
 .mobile-ai-brief-comment{display:grid;grid-template-columns:28px minmax(0,1fr);gap:9px;margin:11px 16px 0;padding:11px 12px;border:1px solid #dbe8fb;border-radius:10px;background:linear-gradient(145deg,#f7faff,#fff)}.mobile-ai-brief-comment>span{display:grid;place-items:center;width:28px;height:28px;border-radius:8px;background:#e8f1ff;color:#2563eb;font-size:13px}.mobile-ai-brief-comment strong{display:block;color:#41536d;font-size:11px}.mobile-ai-brief-comment p{margin:3px 0 0;color:#61728a;font-size:12px;line-height:1.55;overflow-wrap:anywhere}@media(max-width:380px){.mobile-ai-brief-comment{margin-left:13px;margin-right:13px}}
 .mobile-ai-page{padding-bottom:190px}.mobile-ai-composer{position:fixed;right:max(10px,env(safe-area-inset-right,0px));bottom:calc(72px + env(safe-area-inset-bottom,0px));left:max(10px,env(safe-area-inset-left,0px));z-index:45;margin:0;padding:8px;border:1px solid #d8e6f8;border-radius:16px;box-shadow:0 10px 32px #23436d2b}.mobile-ai-composer .mobile-ai-prompt{margin:0}.mobile-ai-composer .mobile-ai-prompt textarea{min-height:42px;max-height:100px;resize:vertical;padding:10px 12px;font-size:16px}.mobile-ai-composer .mobile-ai-suggestions{margin-top:7px}.mobile-ai-composer .mobile-ai-prompt-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:7px}.mobile-ai-composer .mobile-ai-prompt-status{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mobile-ai-send{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border:0;border-radius:50%;background:#2563eb;color:#fff;font-size:22px;line-height:1;box-shadow:0 4px 10px #2563eb38;cursor:pointer}.mobile-ai-send:disabled{opacity:.45;cursor:wait;box-shadow:none}.mobile-ai-send .mobile-ai-spinner{margin:0}.mobile-ai-parsing-message p{display:inline-flex;align-items:center;gap:8px;color:#7e8da4}.mobile-ai-typing-dots{display:inline-flex;align-items:center;gap:3px}.mobile-ai-typing-dots i{width:5px;height:5px;border-radius:50%;background:#8ba5ce;animation:mobile-ai-typing 1.1s infinite ease-in-out}.mobile-ai-typing-dots i:nth-child(2){animation-delay:.15s}.mobile-ai-typing-dots i:nth-child(3){animation-delay:.3s}@keyframes mobile-ai-typing{0%,60%,100%{opacity:.35;transform:translateY(0)}30%{opacity:1;transform:translateY(-2px)}}@media(max-width:380px){.mobile-ai-composer{right:7px;left:7px;padding:7px}.mobile-ai-page{padding-bottom:184px}}
+.mobile-ai-batch-progress{margin:11px 16px 0;padding:10px 11px;border-radius:9px;background:#fff8e7;color:#896823;font-size:12px;line-height:1.55}.mobile-ai-batch-progress.is-ready{background:#e7f8f0;color:#12845e}.mobile-ai-batch-item{display:grid;gap:11px;padding:13px;border:1px solid #dce7f5;border-radius:13px;background:#fbfcff}.mobile-ai-batch-item.is-skipped{background:#f7f9fc;opacity:.72}.mobile-ai-batch-head{display:grid;gap:5px;min-width:0}.mobile-ai-batch-check{display:flex;align-items:center;gap:9px;min-height:44px;color:#32445e;font-size:14px;font-weight:600}.mobile-ai-batch-check input{flex:0 0 20px;width:20px!important;min-height:20px!important;margin:0!important;accent-color:#2563eb}.mobile-ai-batch-summary{margin:0;color:#6b7a90;font-size:12px;line-height:1.5;overflow-wrap:anywhere}.mobile-ai-batch-missing{margin:0;padding:6px 9px;border-radius:8px;background:#fff8e7;color:#896823;font-size:11px;line-height:1.5}.mobile-ai-batch-fields{display:grid;gap:11px}.mobile-ai-batch-fields label{display:block;color:#53637a;font-size:12px;line-height:1.45}.mobile-ai-segmented.is-three{grid-template-columns:repeat(3,1fr)}.mobile-ai-segmented.is-three button{font-size:12px;padding-left:4px;padding-right:4px}
+@media(max-width:380px){.mobile-ai-batch-progress{margin-left:13px;margin-right:13px}.mobile-ai-batch-item{padding:12px}}
 </style>

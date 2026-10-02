@@ -484,7 +484,7 @@ export const aiApi = {
     method: 'POST',
     body: data,
     retry: 1,
-    timeoutMs: 50_000,
+    timeoutMs: 75_000,
     ...requestOptions,
   }),
   /**
@@ -501,7 +501,7 @@ export const aiApi = {
       method: 'POST',
       body,
       retry: 1,
-      timeoutMs: 50_000,
+      timeoutMs: 75_000,
       ...requestOptions,
     }
     return apiFetch('/api/ai/parse', request).catch((error) => {
@@ -510,6 +510,68 @@ export const aiApi = {
       }
       throw error
     })
+  },
+  /**
+   * Parse a bookkeeping request while the model's progress streams in.
+   *
+   * ``onEvent`` receives the provider/reasoning/content/status events and
+   * the promise resolves with the same payload as ``parseMode``.  A backend
+   * without the streaming route is asked through ``parseMode`` instead.
+   */
+  parseStream: async (mode, data = {}, { onEvent, timeoutMs = 200_000, ...requestOptions } = {}) => {
+    const path = '/api/ai/parse-stream'
+    const requestSignal = createTimeoutSignal(requestOptions.signal, timeoutMs)
+    const failure = (status, payload, cause) => {
+      const info = classifyApiFailure(path, status, payload, cause, requestSignal.timedOut())
+      return new ApiError(info.message || errorMessage(payload, `请求失败（${status}）`), status, payload, { kind: info.kind, retryable: info.retryable, path, cause })
+    }
+    try {
+      let response
+      try {
+        response = await fetch(`${API_BASE_URL}${path}`, {
+          method: 'POST',
+          body: JSON.stringify({ ...data, mode }),
+          headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
+          credentials: 'include',
+          signal: requestSignal.signal,
+        })
+      } catch (cause) {
+        throw failure(0, null, cause)
+      }
+      if ([404, 405].includes(response.status) || (response.ok && !response.body)) return await aiApi.parseMode(mode, data, requestOptions)
+      if (!response.ok) {
+        if (response.status === 401 && typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('pennypilot:unauthorized'))
+        throw failure(response.status, await response.json().catch(() => null), null)
+      }
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      for (;;) {
+        let chunk
+        try {
+          chunk = await reader.read()
+        } catch (cause) {
+          throw failure(0, null, cause)
+        }
+        if (chunk.done) break
+        buffer += decoder.decode(chunk.value, { stream: true })
+        let boundary
+        while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+          const line = buffer.slice(0, boundary).split('\n').find((item) => item.startsWith('data:'))
+          buffer = buffer.slice(boundary + 2)
+          if (!line) continue
+          let event
+          try { event = JSON.parse(line.slice(5)) } catch { continue }
+          if (event.type === 'result') return event.data
+          if (event.type === 'error') throw failure(event.status || 503, { detail: event.detail }, null)
+          try { onEvent?.(event) } catch { /* UI callbacks must not break the stream */ }
+        }
+      }
+      // The stream closed without its final result/error event.
+      throw failure(502, null, null)
+    } finally {
+      requestSignal.cleanup()
+    }
   },
   confirm: (data) => apiFetch('/api/ai/confirm', { method: 'POST', body: data }),
   /**
@@ -537,6 +599,11 @@ export const aiApi = {
       throw error
     })
   },
+  /**
+   * Confirm several cash/transfer drafts from one parse.  The backend writes
+   * them in a single commit, so a rejected draft leaves the ledger untouched.
+   */
+  confirmBatch: (drafts) => apiFetch('/api/ai/confirm-batch', { method: 'POST', body: { confirm: true, drafts } }),
   history: (filters = {}) => apiFetch(`/api/ai/reports${queryString(filters)}`).then(listPayload).catch((error) => {
     // Keep compatibility with the initial API proposal while the reports
     // resource is rolled out.  Only a missing route is retried.

@@ -16,7 +16,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
 import httpx
@@ -28,7 +28,7 @@ from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from .ai_schemas import AIAnalyzeRequest, AIParsedTransaction, AIParseResponse
+from .ai_schemas import MAX_PARSE_RECORDS, AIAnalyzeRequest, AIParsedRecord, AIParsedTransaction, AIParseResponse
 from .config import Settings, get_settings
 from .models import AIConfig, AIReport, Category, Partner, PartnerLedgerEntry, PaymentMethod, Transaction, User
 from .timezone import BUSINESS_TIMEZONE_NAME, BUSINESS_TZ, now_utc, to_business, to_utc
@@ -43,6 +43,11 @@ MAX_REPORT_CHARS = 100_000
 # hidden reasoning before returning it, so leave enough headroom to avoid a
 # truncated JSON object.
 AI_PARSE_MAX_TOKENS = 4_096
+# The parser streams its completion, so the read timeout only bounds the gap
+# between two chunks (a reasoning model may stay silent while it thinks) and
+# a long multi-record envelope is not cut off while it is still arriving.
+AI_STREAM_IDLE_TIMEOUT_SECONDS = 30.0
+AI_STREAM_TOTAL_TIMEOUT_SECONDS = 90.0
 DEEPSEEK_READ_TIMEOUT_SECONDS = 30.0
 DEEPSEEK_CONNECT_TIMEOUT_SECONDS = 10.0
 
@@ -54,6 +59,39 @@ logger = logging.getLogger(__name__)
 # required-by-strict is part of the OpenAI-compatible structured-output
 # contract.  The backend still recomputes field_status and completeness after
 # matching candidates, so those model hints never become bookkeeping facts.
+_AI_PARSE_RECORD_PROPERTIES: dict[str, Any] = {
+    "occurred_at": {"type": ["string", "null"]},
+    "kind": {"type": "string", "enum": ["cashflow", "transfer"]},
+    "direction": {"type": ["string", "null"], "enum": ["income", "expense", None]},
+    "amount_cents": {"type": ["integer", "null"], "minimum": 1},
+    "category_id": {"type": ["integer", "null"], "minimum": 1},
+    "category_name": {"type": ["string", "null"]},
+    "payment_method_id": {"type": ["integer", "null"], "minimum": 1},
+    "payment_method_name": {"type": ["string", "null"]},
+    "transfer_payment_method_id": {"type": ["integer", "null"], "minimum": 1},
+    "transfer_payment_method_name": {"type": ["string", "null"]},
+    "partner_id": {"type": ["integer", "null"], "minimum": 1},
+    "partner_name": {"type": ["string", "null"]},
+    "partner_ledger_type": {"type": ["string", "null"], "enum": ["balance_check", None]},
+    "partner_ledger_amount_cents": {"type": ["integer", "null"]},
+    "partner_balance_after_cents": {"type": ["integer", "null"], "minimum": 0},
+    "partner_balance_kind": {"type": ["string", "null"], "enum": ["prepaid_balance", "credit_used", None]},
+    "notes": {"type": ["string", "null"]},
+}
+
+# Extra records are matched by candidate name and never carry a partner
+# balance, so they use a compact shape: output length drives the provider's
+# response time, and a long run of purchases must still fit the timeout.
+_AI_PARSE_EXTRA_RECORD_KEYS = [
+    "occurred_at", "kind", "direction", "amount_cents", "category_name",
+    "payment_method_name", "transfer_payment_method_name", "partner_name", "notes",
+]
+
+_AI_PARSE_FIELD_STATUS_KEYS = [
+    "occurred_at", "direction", "amount_cents", "category",
+    "payment_method", "transfer_payment_method", "partner",
+]
+
 AI_PARSE_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -63,49 +101,18 @@ AI_PARSE_JSON_SCHEMA: dict[str, Any] = {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "occurred_at": {"type": ["string", "null"]},
-                "kind": {"type": "string", "enum": ["cashflow", "transfer"]},
-                "direction": {"type": ["string", "null"], "enum": ["income", "expense", None]},
-                "amount_cents": {"type": ["integer", "null"], "minimum": 1},
-                "category_id": {"type": ["integer", "null"], "minimum": 1},
-                "category_name": {"type": ["string", "null"]},
-                "payment_method_id": {"type": ["integer", "null"], "minimum": 1},
-                "payment_method_name": {"type": ["string", "null"]},
-                "transfer_payment_method_id": {"type": ["integer", "null"], "minimum": 1},
-                "transfer_payment_method_name": {"type": ["string", "null"]},
-                "partner_id": {"type": ["integer", "null"], "minimum": 1},
-                "partner_name": {"type": ["string", "null"]},
-                "partner_ledger_type": {"type": ["string", "null"], "enum": ["balance_check", None]},
-                "partner_ledger_amount_cents": {"type": ["integer", "null"]},
-                "partner_balance_after_cents": {"type": ["integer", "null"], "minimum": 0},
-                "partner_balance_kind": {"type": ["string", "null"], "enum": ["prepaid_balance", "credit_used", None]},
-                "notes": {"type": ["string", "null"]},
+                **_AI_PARSE_RECORD_PROPERTIES,
                 "field_status": {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "occurred_at": {"type": "string", "enum": ["explicit", "inferred", "missing"]},
-                        "direction": {"type": "string", "enum": ["explicit", "inferred", "missing"]},
-                        "amount_cents": {"type": "string", "enum": ["explicit", "inferred", "missing"]},
-                        "category": {"type": "string", "enum": ["explicit", "inferred", "missing"]},
-                        "payment_method": {"type": "string", "enum": ["explicit", "inferred", "missing"]},
-                        "transfer_payment_method": {"type": "string", "enum": ["explicit", "inferred", "missing"]},
-                        "partner": {"type": "string", "enum": ["explicit", "inferred", "missing"]},
+                        key: {"type": "string", "enum": ["explicit", "inferred", "missing"]}
+                        for key in _AI_PARSE_FIELD_STATUS_KEYS
                     },
-                    "required": [
-                        "occurred_at", "direction", "amount_cents", "category",
-                        "payment_method", "transfer_payment_method", "partner",
-                    ],
+                    "required": _AI_PARSE_FIELD_STATUS_KEYS,
                 },
             },
-            "required": [
-                "occurred_at", "kind", "direction", "amount_cents", "category_id",
-                "category_name", "payment_method_id", "payment_method_name",
-                "transfer_payment_method_id", "transfer_payment_method_name",
-                "partner_id", "partner_name", "partner_ledger_type",
-                "partner_ledger_amount_cents", "partner_balance_after_cents",
-                "partner_balance_kind", "notes", "field_status",
-            ],
+            "required": [*_AI_PARSE_RECORD_PROPERTIES, "field_status"],
         },
         "missing_fields": {
             "type": "array",
@@ -116,8 +123,18 @@ AI_PARSE_JSON_SCHEMA: dict[str, Any] = {
         },
         "follow_up_question": {"type": ["string", "null"]},
         "brief_comment": {"type": ["string", "null"]},
+        # Further records described by the same message.
+        "extra_records": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {key: _AI_PARSE_RECORD_PROPERTIES[key] for key in _AI_PARSE_EXTRA_RECORD_KEYS},
+                "required": _AI_PARSE_EXTRA_RECORD_KEYS,
+            },
+        },
     },
-    "required": ["status", "parsed", "missing_fields", "follow_up_question", "brief_comment"],
+    "required": ["status", "parsed", "missing_fields", "follow_up_question", "brief_comment", "extra_records"],
 }
 
 AI_PARSE_RESPONSE_FORMAT = {
@@ -168,6 +185,10 @@ def reasoning_controls_for_provider(provider: "Provider") -> dict[str, Any]:
         return {"thinking": {"type": "disabled"}}
     if re.match(r"^gpt-5(?:[.\-]|$)", model):
         return {"reasoning_effort": "none"}
+    if re.match(r"^gpt-6(?:[.\-]|$)", model):
+        # GPT-6 cannot switch reasoning off; "low" is its fastest level and
+        # makes the gateway stream the reasoning summary.
+        return {"reasoning_effort": "low"}
     return {}
 
 
@@ -666,6 +687,7 @@ class AIService:
         max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
         request_id: str = "-",
+        on_delta: Callable[[str, str], None] | None = None,
     ) -> str:
         if not self.settings.ai_enabled or not provider.api_key:
             raise AIServiceError("not_configured")
@@ -675,7 +697,10 @@ class AIService:
             "model": provider.model,
             "messages": messages,
             "temperature": 0.2,
-            "stream": False,
+            # ``on_delta`` switches to a streamed completion: it is called with
+            # ("start", "") for every HTTP attempt and then with each
+            # ("reasoning" | "content", text) delta.
+            "stream": on_delta is not None,
             **reasoning_controls,
         }
         if max_tokens is not None:
@@ -711,6 +736,9 @@ class AIService:
                 )
                 try:
                     timeout_seconds = max(self.settings.ai_timeout_seconds, DEEPSEEK_READ_TIMEOUT_SECONDS) if is_deepseek else self.settings.ai_timeout_seconds
+                    if on_delta is not None:
+                        timeout_seconds = max(timeout_seconds, AI_STREAM_IDLE_TIMEOUT_SECONDS)
+                        on_delta("start", "")
                     connect_timeout = min(
                         DEEPSEEK_CONNECT_TIMEOUT_SECONDS if is_deepseek else 5.0,
                         timeout_seconds,
@@ -734,11 +762,17 @@ class AIService:
                                 raise AIServiceError("provider_http_error")
                             chunks: list[bytes] = []
                             size = 0
-                            for chunk in response.iter_bytes():
-                                size += len(chunk)
-                                if size > limit:
-                                    raise AIServiceError("provider_response_too_large")
-                                chunks.append(chunk)
+                            streamed: str | None = None
+                            if on_delta is not None:
+                                streamed = self._read_stream(
+                                    response, limit, on_delta, attempt_started + AI_STREAM_TOTAL_TIMEOUT_SECONDS
+                                )
+                            else:
+                                for chunk in response.iter_bytes():
+                                    size += len(chunk)
+                                    if size > limit:
+                                        raise AIServiceError("provider_response_too_large")
+                                    chunks.append(chunk)
                     raw_response = b"".join(chunks)
                     logger.debug(
                         "AI provider response id=%s provider=%s model=%s structured=%s format=%s status=200 response_bytes=%d elapsed_ms=%d",
@@ -750,8 +784,11 @@ class AIService:
                         len(raw_response),
                         round((time.monotonic() - attempt_started) * 1000),
                     )
-                    data = json.loads(raw_response.decode("utf-8"))
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content")
+                    if streamed is not None:
+                        content = streamed
+                    else:
+                        data = json.loads(raw_response.decode("utf-8"))
+                        content = data.get("choices", [{}])[0].get("message", {}).get("content")
                     if not isinstance(content, str) or not content.strip():
                         # DeepSeek documents that JSON Output can occasionally
                         # return HTTP 200 with an empty content. Retry the same
@@ -794,6 +831,47 @@ class AIService:
                     )
                     raise AIServiceError("provider_unavailable")
         raise AIServiceError("provider_http_error")
+
+    @staticmethod
+    def _read_stream(response: Any, limit: int, on_delta: Callable[[str, str], None], deadline: float) -> str:
+        """Collect an OpenAI-compatible SSE completion, reporting deltas as they arrive."""
+
+        parts: list[str] = []
+        plain: list[str] = []
+        size = 0
+        for line in response.iter_lines():
+            if time.monotonic() > deadline:
+                raise AIServiceError("provider_unavailable")
+            if not line.startswith("data:"):
+                # A gateway that ignores ``stream`` answers with one JSON body.
+                size += len(line)
+                if size > limit:
+                    raise AIServiceError("provider_response_too_large")
+                plain.append(line)
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            chunk = json.loads(data)
+            for choice in (chunk.get("choices") or []) if isinstance(chunk, dict) else []:
+                delta = choice.get("delta") or {}
+                reasoning = delta.get("reasoning_content")
+                if isinstance(reasoning, str) and reasoning:
+                    on_delta("reasoning", reasoning)
+                text_delta = delta.get("content")
+                if isinstance(text_delta, str) and text_delta:
+                    # SSE framing is many times larger than the text it
+                    # carries, so the limit applies to the collected content.
+                    size += len(text_delta.encode("utf-8"))
+                    if size > limit:
+                        raise AIServiceError("provider_response_too_large")
+                    parts.append(text_delta)
+                    on_delta("content", text_delta)
+        if parts or not plain:
+            return "".join(parts)
+        body = json.loads("\n".join(plain))
+        content = body.get("choices", [{}])[0].get("message", {}).get("content")
+        return content if isinstance(content, str) else ""
 
     @staticmethod
     def _json_content(content: str) -> dict[str, Any]:
@@ -880,7 +958,7 @@ class AIService:
         # the envelope instead of inside ``parsed``.  It is advisory model
         # metadata either way and is intentionally discarded before Pydantic
         # validation; the backend recomputes the authoritative values.
-        envelope_keys = {"status", "parsed", "missing_fields", "follow_up_question", "brief_comment", "field_status"}
+        envelope_keys = {"status", "parsed", "missing_fields", "follow_up_question", "brief_comment", "field_status", "extra_records"}
         if "parsed" in raw:
             if set(raw) - envelope_keys:
                 raise AIServiceError("provider_invalid_schema")
@@ -893,6 +971,20 @@ class AIService:
         brief_comment = raw.get("brief_comment")
         if brief_comment is None:
             brief_comment = parsed.pop("brief_comment", None)
+        extra_records = raw.get("extra_records") or []
+        if not isinstance(extra_records, list) or any(not isinstance(item, dict) for item in extra_records):
+            raise AIServiceError("provider_invalid_schema")
+        return {
+            "status": raw.get("status"),
+            "parsed": AIService._normalize_record_fields(parsed),
+            "missing_fields": _canonical_missing_fields(raw.get("missing_fields", [])),
+            "follow_up_question": raw.get("follow_up_question"),
+            "brief_comment": _clean_brief_comment(brief_comment),
+            "extra_records": [AIService._normalize_record_fields(item) for item in extra_records],
+        }
+
+    @staticmethod
+    def _normalize_record_fields(parsed: dict[str, Any]) -> dict[str, Any]:
         aliases = {
             "time": "occurred_at",
             "occurred_time": "occurred_at",
@@ -943,17 +1035,69 @@ class AIService:
             normalized[mapped] = value
         if "amount_cents" not in normalized and "amount" in normalized:
             normalized["amount_cents"] = _amount_to_cents(normalized.pop("amount"))
-        return {
-            "status": raw.get("status"),
-            "parsed": normalized,
-            "missing_fields": _canonical_missing_fields(raw.get("missing_fields", [])),
-            "follow_up_question": raw.get("follow_up_question"),
-            "brief_comment": _clean_brief_comment(brief_comment),
-        }
+        return normalized
+
+    @staticmethod
+    def _has_cash_fields(value: dict[str, Any]) -> bool:
+        return value.get("kind") == "transfer" or any(
+            value.get(key) is not None
+            for key in ("direction", "amount_cents", "payment_method_id", "payment_method_name")
+        )
 
     def _complete_parse(self, raw: dict[str, Any], categories: list[Candidate], methods: list[Candidate], partners: list[Candidate], reference: datetime, mode: str = "cash") -> AIParseResponse:
         normalized = self._normalize_model_payload(raw)
-        value = normalized["parsed"]
+        if normalized["status"] not in {None, "complete", "need_more_info"}:
+            raise AIServiceError("provider_invalid_schema")
+        # Partner mode confirms exactly one balance observation.
+        extras = [] if mode == "partner" else normalized["extra_records"]
+        cash_values = [item for item in (normalized["parsed"], *extras) if self._has_cash_fields(item)] if extras else []
+        if len(cash_values) < 2:
+            record = self._complete_record(normalized["parsed"], normalized["missing_fields"], categories, methods, partners, reference, mode)
+            return AIParseResponse(
+                status=record.status,
+                mode=mode,
+                parsed=record.parsed,
+                missing_fields=record.missing_fields,
+                follow_up_question=record.follow_up_question,
+                brief_comment=normalized["brief_comment"] or _default_brief_comment(record.parsed, mode),
+                source="model",
+                warning="本次只整理了第一笔记录，其余内容请单独描述。" if extras else None,
+            )
+        # A batch is confirmed as plain cash/transfer records.  Current-account
+        # balances keep the single-record contract, so they are dropped here
+        # with a visible warning instead of being confirmed half-way.
+        warnings: list[str] = []
+        ledger_keys = ("partner_ledger_type", "partner_ledger_amount_cents", "partner_balance_after_cents", "partner_balance_kind")
+        if any(item.get(key) is not None for item in (normalized["parsed"], *extras) for key in ("partner_ledger_type", "partner_balance_after_cents")):
+            warnings.append("多笔记录暂不支持同时更新往来未结算余额，请单独记录余额变化。")
+        if len(cash_values) > MAX_PARSE_RECORDS:
+            cash_values = cash_values[:MAX_PARSE_RECORDS]
+            warnings.append(f"一次最多整理 {MAX_PARSE_RECORDS} 笔记录，超出的部分请分批描述。")
+        records: list[AIParsedRecord] = []
+        for item in cash_values:
+            for key in ledger_keys:
+                item[key] = None
+            reported = normalized["missing_fields"] if item is normalized["parsed"] else []
+            records.append(self._complete_record(item, reported, categories, methods, partners, reference, mode))
+        missing = [field for record in records for field in record.missing_fields]
+        follow = "".join(
+            f"第 {index} 笔{record.follow_up_question}"
+            for index, record in enumerate(records, start=1)
+            if record.follow_up_question
+        )
+        return AIParseResponse(
+            status="complete" if not missing else "need_more_info",
+            mode=mode,
+            parsed=records[0].parsed,
+            missing_fields=list(dict.fromkeys(missing)),
+            follow_up_question=follow[:1000] or None,
+            brief_comment=normalized["brief_comment"] or f"共整理出 {len(records)} 笔记录，请逐笔核对后勾选需要入账的记录。",
+            source="model",
+            warning=" ".join(warnings) or None,
+            records=records,
+        )
+
+    def _complete_record(self, value: dict[str, Any], reported_missing: list[str], categories: list[Candidate], methods: list[Candidate], partners: list[Candidate], reference: datetime, mode: str = "cash") -> AIParsedRecord:
         # Partner mode has no cash dictionary requirements. Confirmation still
         # enforces the selected mode and ignores legacy partner fields in cash
         # mode, preserving parse compatibility for older clients.
@@ -966,7 +1110,6 @@ class AIService:
             value["transfer_payment_method_id"] = None
             value["transfer_payment_method_name"] = None
             value["kind"] = "cashflow"
-        reported_missing = normalized["missing_fields"]
         inferred: set[str] = set()
         if value.get("occurred_at") is None:
             value["occurred_at"] = reference
@@ -1054,14 +1197,10 @@ class AIService:
         if missing:
             labels = {"direction": "收支方向", "amount_cents": "金额", "category": "分类", "payment_method": "来源账户", "transfer_payment_method": "转入/还款账户", "partner": "往来单位"}
             follow = "请补充：" + "、".join(labels.get(x, x) for x in missing) + "。"
-        status_value = normalized["status"]
-        if status_value not in {None, "complete", "need_more_info"}:
-            raise AIServiceError("provider_invalid_schema")
         payload = parsed.model_dump()
         payload["field_status"] = _field_status(payload, missing, inferred)
         parsed = AIParsedTransaction.model_validate(payload)
-        brief_comment = normalized["brief_comment"] or _default_brief_comment(parsed, mode)
-        return AIParseResponse(status=status, mode=mode, parsed=parsed, missing_fields=missing, follow_up_question=follow, brief_comment=brief_comment, source="model")
+        return AIParsedRecord(status=status, parsed=parsed, missing_fields=missing, follow_up_question=follow)
 
     def deterministic_parse(self, text_value: str, categories: list[Candidate], methods: list[Candidate], partners: list[Candidate], reference: datetime, warning: str | None = None, mode: str = "cash") -> AIParseResponse:
         def extract_observed_amount(*patterns: str) -> int | None:
@@ -1403,9 +1542,20 @@ class AIService:
             warning=current.warning or warning,
         )
 
-    def parse(self, db: Session, user_id: int, text_value: str, conversation: list[dict[str, str]] | None = None, reference_time: datetime | None = None, mode: str = "cash") -> AIParseResponse:
+    def parse(self, db: Session, user_id: int, text_value: str, conversation: list[dict[str, str]] | None = None, reference_time: datetime | None = None, mode: str = "cash", on_event: Callable[[dict[str, Any]], None] | None = None) -> AIParseResponse:
+        """Parse a bookkeeping message into a proposal.
+
+        ``on_event`` receives progress events while the model works:
+        ``provider`` when a channel is tried, ``start`` for each request to
+        it, ``reasoning``/``content`` text deltas and ``status`` notes.
+        """
+
         if mode not in {"cash", "partner", "combined"}:
             mode = "cash"
+        emit = on_event or (lambda event: None)
+
+        def on_delta(kind: str, text_delta: str) -> None:
+            emit({"type": kind, "text": text_delta})
         text_value = text_value.strip()[:MAX_INPUT_CHARS]
         # Normalize the client-provided instant first (naive values retain the
         # legacy UTC interpretation), then derive a Beijing reference for
@@ -1430,7 +1580,7 @@ class AIService:
             '"direction":"missing","amount_cents":"missing","category":"missing",'
             '"payment_method":"missing","transfer_payment_method":"missing","partner":"missing"}},'
             '"missing_fields":["direction","amount_cents","payment_method"],"follow_up_question":"请补充信息",'
-            '"brief_comment":"一句话简评"}。'
+            '"brief_comment":"一句话简评","extra_records":[]}。'
             "status 仅允许 complete 或 need_more_info。kind 仅允许 cashflow 或 transfer；direction 仅允许 income 或 expense；"
             "amount_cents 必须是整数分。field_status 的键仅使用 occurred_at、direction、"
             "amount_cents、category、payment_method、transfer_payment_method、partner，值仅允许 explicit、inferred、missing，"
@@ -1453,7 +1603,9 @@ class AIService:
             "也不要把 supplier 或 customer 当作流水类型。"
             "分类、支付方式和往来账户应优先使用下面候选项的 id 与 name。"
             "不可确定的必填字段填 null，并使用规范业务键列入 missing_fields。可选项如下："
-            + "多轮对话规则：conversation 与当前消息共同描述同一张尚未确认的记录，必须综合所有 user 消息输出一份字段齐全的最新草稿，不能只解析最后一句；后续省略的字段沿用此前用户已明确的信息，后续明确重述、纠正、否定或删除的字段以最新 user 消息为准。assistant 消息只可能是追问或简评，绝不能把 assistant 消息中的金额、日期、账户、分类或示例当作账务事实。若用户明确说‘新的一笔’‘另记一笔’，只解析该标记之后的新记录，不得混入前一笔。"
+            + "多轮对话规则：conversation 与当前消息共同描述同一批尚未确认的记录（通常是一笔，也可能是多笔），必须综合所有 user 消息输出一份字段齐全的最新草稿，不能只解析最后一句；后续省略的字段沿用此前用户已明确的信息，后续明确重述、纠正、否定或删除的字段以最新 user 消息为准。assistant 消息只可能是追问或简评，绝不能把 assistant 消息中的金额、日期、账户、分类或示例当作账务事实。若用户在新消息中明确说‘新的一笔’‘另记一笔’来另起一张记录，只解析该标记之后的新记录，不得混入此前消息里的记录。"
+            + "多笔记录规则：一条消息里可能包含多笔相互独立的记录，例如一连串消费‘早餐微信12元，午饭支付宝35元，打车花呗28元’，或用‘还有’‘另外’‘然后’连接的几笔收支。此时第一笔写入 parsed，其余按用户描述的顺序逐笔写入 extra_records 数组；extra_records 的每个元素只包含 " + "、".join(_AI_PARSE_EXTRA_RECORD_KEYS) + " 这几个键，含义与 parsed 中的同名字段一致，分类、账户和往来单位直接填写候选项的 name 原文，不要输出 id 和 field_status；每笔都有各自的金额、分类、账户、时间和备注，金额不得相加或合并，最多 " + str(MAX_PARSE_RECORDS) + " 笔。只有一笔记录时 extra_records 必须是空数组 []。用户没有逐笔重复、但显然共用的信息（如同一天、同一个支付账户）要填入每一笔。missing_fields 与 follow_up_question 只针对 parsed，extra_records 中无法确定的必填字段填 null 即可。此前草稿已包含多笔时，后续消息只补充或修改其中某几笔（如‘第二笔是支付宝’），必须重新输出全部记录的最新草稿并保持原有顺序。一笔现金收支及其对应的往来未结算余额仍是同一条记录，必须都写在 parsed 中，不得拆成两笔。"
+            + "抵扣规则：还款或转账时使用了还款券、立减金、红包等抵扣，抵扣部分并没有从来源账户实际扣除，必须拆成两笔：parsed 为 kind=transfer 的还款，amount_cents 是包含抵扣在内的还款总额，来源账户转入被还款的账户；extra_records 再加一笔 kind=cashflow、direction=income，amount_cents 是抵扣金额，payment_method 与还款来源账户相同，分类优先‘其他收入’，notes 写明如‘还款券抵扣’。例如‘招行储蓄卡还信用卡2000元，用了一张50元还款券’应输出 transfer amount_cents=200000（招行储蓄卡转入信用卡）和 income amount_cents=5000（招行储蓄卡，其他收入，notes=还款券抵扣）。若用户给出的是实际扣款金额，则还款总额=实际扣款+抵扣金额。"
             + "brief_comment 必须根据合并后的本次记录写一句自然、具体、不过度评价的中文简评，建议不超过 80 个汉字；可以提示这笔记录会影响现金、负债、投资或未结算余额中的哪些账，但不得编造用户未提供的事实。若 notes=null，必须在 brief_comment 中顺带礼貌询问用户补充这笔收付款的用途、项目或原因；不要因此把记录改成 need_more_info，也不要把 notes 加入 missing_fields。brief_comment 不得代替真正缺失必填字段时的 follow_up_question。"
             + f"当前模式={mode}。cash 只输出现金收支；partner 只输出未结算余额，不需要 direction/category/payment_method；combined 用于统一对话：有现金就输出现金字段，有往来就输出 partner_balance 字段，只有往来变化时现金字段可以全部为 null，同时包含两者时两组字段都输出；现金动作和往来余额盘点必须分开解析，即使金额相同也不能合并或丢弃其中一组。例如‘支付宝给供应商A充值1000元，目前未结算余额1000元’应同时输出现金 expense/amount_cents=100000/payment_method_name=支付宝（分类优先其他支出），以及 partner_ledger_type=balance_check/partner_ledger_amount_cents=0/partner_balance_after_cents=100000/partner_balance_kind=prepaid_balance。所有结果都必须由用户明确确认。"
             + "payment_methods 的 kind 是账户性质：cash=现金账户，liability=信用卡/花呗/白条/贷款等负债账户，investment=投资账户。京东白条、花呗、信用卡、借呗等属于 payment_method，不是 partner。"
@@ -1481,6 +1633,7 @@ class AIService:
             len(providers),
         )
         for index, provider in enumerate(providers):
+            emit({"type": "provider", "name": provider.name, "model": provider.model})
             try:
                 raw = self._json_content(
                     self._chat(
@@ -1489,6 +1642,7 @@ class AIService:
                         max_tokens=AI_PARSE_MAX_TOKENS,
                         response_format=AI_PARSE_RESPONSE_FORMAT,
                         request_id=request_id,
+                        on_delta=on_delta,
                     )
                 )
                 response = self._complete_parse(raw, categories, methods, partners, reference, mode)
@@ -1512,6 +1666,7 @@ class AIService:
                             ),
                         },
                     ]
+                    emit({"type": "status", "code": "self_check"})
                     try:
                         revised_raw = self._json_content(
                             self._chat(
@@ -1520,6 +1675,7 @@ class AIService:
                                 max_tokens=AI_PARSE_MAX_TOKENS,
                                 response_format=AI_PARSE_RESPONSE_FORMAT,
                                 request_id=request_id,
+                                on_delta=on_delta,
                             )
                         )
                         revised_response = self._complete_parse(
@@ -1590,8 +1746,10 @@ class AIService:
                 if not self.settings.ai_local_fallback:
                     raise last_error from exc
             if index + 1 < len(providers):
+                emit({"type": "status", "code": "provider_failed"})
                 continue
             if self.settings.ai_local_fallback:
+                emit({"type": "status", "code": "local_fallback"})
                 warning = "AI 主通道和备用通道均不可用，已使用本地规则解析。" if len(providers) > 1 else ("AI 服务暂不可用，已使用本地规则解析。" if provider.api_key else "未配置 AI 服务，已使用本地规则解析。")
                 return self.deterministic_parse_with_context(text_value, conversation or [], categories, methods, partners, reference, warning, mode)
             raise last_error or AIServiceError("provider_unavailable")

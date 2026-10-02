@@ -45,14 +45,24 @@
       :confirm-draft="confirmDraft"
       :load-history="loadHistory"
       :partner-ledger-label="partnerLedgerLabel"
+      :batch-drafts="batchDrafts"
+      :batch-ready="batchReady"
+      :batch-progress="batchProgress"
+      :batch-selected-count="selectedBatchDrafts.length"
+      :batch-draft-missing="batchDraftMissing"
+      :batch-draft-summary="batchDraftSummary"
+      :set-batch-draft-type="setBatchDraftType"
+      :categories-for-batch-draft="categoriesForBatchDraft"
+      :confirm-batch="confirmBatch"
+      :thinking="thinking"
     />
 
     <template v-else>
     <section class="ai-chat-header panel">
       <div class="compose-modebar">
-        <div class="compose-mode-current"><span class="compose-mode-icon" aria-hidden="true">{{ isPartnerMode ? '↔' : isCombinedMode ? '✦' : '●' }}</span><div><strong>{{ isPartnerMode ? 'AI 已识别为未结算余额' : isCombinedMode ? 'AI 会同时整理现金与未结算余额' : 'AI 已识别为现金收支' }}</strong><span>不用选择模式，一句话里包含的变化会自动分账</span></div></div>
+        <div class="compose-mode-current"><span class="compose-mode-icon" aria-hidden="true">{{ isPartnerMode ? '↔' : isCombinedMode ? '✦' : '●' }}</span><div><strong>{{ isBatchMode ? `AI 已整理出 ${batchDrafts.length} 笔记录` : isPartnerMode ? 'AI 已识别为未结算余额' : isCombinedMode ? 'AI 会同时整理现金与未结算余额' : 'AI 已识别为现金收支' }}</strong><span>不用选择模式，一句话里包含的变化会自动分账</span></div></div>
       </div>
-      <div class="section-heading"><div class="ai-badge">{{ isPartnerMode ? '↔' : '✦' }}</div><div><h2>说一句话，记账、查收支、要报告都可以</h2><p>AI 会自动判断这是现金收支、往来余额变化，还是两者同时发生；也可以直接问本月、本年或全部的收支情况，或让它生成收支报告。记账在确认前不会写入账本。</p></div></div>
+      <div class="section-heading"><div class="ai-badge">{{ isPartnerMode ? '↔' : '✦' }}</div><div><h2>说一句话，记账、查收支、要报告都可以</h2><p>AI 会自动判断这是现金收支、往来余额变化，还是两者同时发生；一句话里说了多笔，会拆成多条记录供你勾选。也可以直接问本月、本年或全部的收支情况，或让它生成收支报告。记账在确认前不会写入账本。</p></div></div>
       <div class="ai-flow" aria-label="AI 记账流程"><span class="ai-flow-step is-active"><b>1</b>描述</span><i aria-hidden="true">→</i><span class="ai-flow-step"><b>2</b>AI 整理</span><i aria-hidden="true">→</i><span class="ai-flow-step"><b>3</b>一次确认</span></div>
       <div v-if="parseSourceLabel || parseWarning" class="parse-result-meta" role="status" aria-live="polite">
         <span v-if="parseSourceLabel" class="parse-source-badge" :class="{ 'is-fallback': isFallbackParse }"><i aria-hidden="true"></i>{{ parseSourceLabel }}</span>
@@ -69,7 +79,7 @@
 
     <section v-if="conversation.length" class="conversation panel">
       <div class="panel-title"><div><h2>对话</h2><p>继续补充即可，确认前不会写入账本</p></div><button class="text-button" type="button" title="清空本轮对话和已解析草稿" @click="resetConversation">清空对话与草稿</button></div>
-      <div ref="conversationThread" class="messages" aria-live="polite"><div v-for="(message, index) in conversation" :key="`${index}-${message.content}`" class="message" :class="[message.role === 'user' ? 'user-message' : 'assistant-message', { 'chat-message': message.kind === 'chat' }]"><span class="message-avatar">{{ message.role === 'user' ? '我' : '✦' }}</span><div class="message-bubble"><p>{{ message.content }}</p><router-link v-if="message.report_id" class="message-link" :to="{ path: '/reports', query: { report: message.report_id } }">报告已保存，在财务分析中查看 →</router-link></div></div><div v-if="parsing" class="message assistant-message parsing-message"><span class="message-avatar">✦</span><p><span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>{{ retryStatus || parsingLabel }} <span aria-hidden="true">↓</span></p></div></div>
+      <div ref="conversationThread" class="messages" aria-live="polite"><div v-for="(message, index) in conversation" :key="`${index}-${message.content}`" class="message" :class="[message.role === 'user' ? 'user-message' : 'assistant-message', { 'chat-message': message.kind === 'chat' }]"><span class="message-avatar">{{ message.role === 'user' ? '我' : '✦' }}</span><AiThinkingPanel v-if="message.kind === 'thinking'" v-model:open="message.open" :entries="message.entries" :seconds="message.seconds" /><div v-else class="message-bubble"><p>{{ message.content }}</p><router-link v-if="message.report_id" class="message-link" :to="{ path: '/reports', query: { report: message.report_id } }">报告已保存，在财务分析中查看 →</router-link></div></div><div v-if="parsing" class="message assistant-message parsing-message"><span class="message-avatar">✦</span><AiThinkingPanel v-if="thinking.active" v-model:open="thinking.open" active :entries="thinking.entries" :seconds="thinking.seconds" :stage="retryStatus || thinking.stage" /><p v-else><span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>{{ retryStatus || parsingLabel }} <span aria-hidden="true">↓</span></p></div></div>
     </section>
 
     <section v-if="draftVisible" class="confirm-card panel" :class="{ 'partner-confirm-card': isPartnerMode, 'combined-confirm-card': combinedVisible }">
@@ -111,10 +121,30 @@
       </form>
     </section>
 
+    <section v-if="isBatchMode" class="confirm-card batch-card panel">
+      <div class="panel-title"><div><h2>确认多笔记录</h2><p>逐笔核对，勾选需要入账的记录后一次确认；未勾选的不会写入账本</p></div><span class="draft-status">已选 {{ selectedBatchDrafts.length }} / {{ batchDrafts.length }}</span></div>
+      <p class="draft-progress" :class="{ ready: batchReady }" role="status">{{ batchProgress }}</p>
+      <form class="draft-form" @submit.prevent="confirmBatch">
+        <article v-for="(item, index) in batchDrafts" :key="item.key" class="batch-item" :class="{ 'is-skipped': !item.selected }">
+          <header class="batch-item-head">
+            <label class="batch-item-check"><input v-model="item.selected" type="checkbox" /><strong>第 {{ index + 1 }} 笔</strong></label>
+            <span class="batch-item-summary">{{ batchDraftSummary(item) }}</span>
+            <em v-if="item.selected && batchDraftMissing(item).length" class="batch-item-missing">还需补充：{{ batchDraftMissing(item).join('、') }}</em>
+          </header>
+          <template v-if="item.selected">
+            <div class="draft-direction batch-type" role="group" :aria-label="`第 ${index + 1} 笔的类型`"><button type="button" :class="{ selected: !isTransferItem(item) && item.direction === 'expense' }" @click="setBatchDraftType(item, 'expense')">现金流出</button><button type="button" :class="{ selected: !isTransferItem(item) && item.direction === 'income' }" @click="setBatchDraftType(item, 'income')">现金流入</button><button type="button" :class="{ selected: isTransferItem(item) }" @click="setBatchDraftType(item, 'transfer')">转账/还款</button></div>
+            <div class="draft-grid"><label>金额（元）<input v-model.trim="item.amount" inputmode="decimal" pattern="^[0-9]+([.][0-9]{1,2})?$" required /></label><label>发生时间<input v-model="item.occurred_at" type="datetime-local" required /></label><label v-if="!isTransferItem(item)">分类<select v-model="item.category_id" required><option value="" disabled>请选择分类</option><option v-for="category in categoriesForBatchDraft(item)" :key="category.id" :value="String(category.id)">{{ category.name }}</option></select></label><label>{{ isTransferItem(item) ? '来源账户' : item.direction === 'income' ? '收款账户' : '支付账户' }}<select v-model="item.payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="method in paymentMethods" :key="method.id" :value="String(method.id)">{{ paymentMethodOptionLabel(method) }}</option></select></label><label v-if="isTransferItem(item)">转入/还款账户<select v-model="item.transfer_payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="method in paymentMethods" :key="method.id" :value="String(method.id)">{{ paymentMethodOptionLabel(method) }}</option></select></label><label v-else-if="partners.length">关联客户/供应商（仅标签）<select v-model="item.partner_id"><option value="">不关联</option><option v-for="partner in partners" :key="partner.id" :value="String(partner.id)">{{ partner.name }}</option></select></label><label>备注<textarea v-model.trim="item.notes" rows="1" maxlength="500"></textarea></label></div>
+          </template>
+        </article>
+        <div v-if="confirmError" class="form-error" role="alert">{{ confirmError }}</div>
+        <div class="confirm-actions"><button class="outline-button" type="button" title="清空本轮对话和已解析草稿" @click="resetConversation" :disabled="confirming">清空对话与草稿</button><button class="primary" type="submit" :disabled="confirming || !batchReady"><span v-if="confirming" class="spinner"></span>{{ confirming ? '确认中…' : `确认所选 ${selectedBatchDrafts.length} 笔` }}</button></div>
+      </form>
+    </section>
+
     <section class="chat-composer panel">
       <form class="prompt-form" @submit.prevent="submitPrompt">
         <label class="sr-only" for="desktop-ai-prompt-input">记账描述</label>
-        <textarea id="desktop-ai-prompt-input" ref="promptInput" v-model.trim="prompt" :disabled="parsing || confirming" rows="1" maxlength="1000" placeholder="描述一笔收支或往来…" @keydown.enter.exact.prevent="submitPrompt"></textarea>
+        <textarea id="desktop-ai-prompt-input" ref="promptInput" v-model.trim="prompt" :disabled="parsing || confirming" rows="1" maxlength="1000" placeholder="描述一笔或多笔收支、往来…" @keydown.enter.exact.prevent="submitPrompt"></textarea>
         <div class="quick-prompts" aria-label="常用描述示例">
           <span>快速开始</span>
           <button v-for="example in quickPrompts" :key="example.label" type="button" :disabled="parsing || confirming" @click="useQuickPrompt(example.text)">{{ example.label }}</button>
@@ -135,7 +165,8 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import AiThinkingPanel from '../components/AiThinkingPanel.vue'
 import AppLayout from '../components/AppLayout.vue'
 import { useViewport } from '../composables/useViewport'
 import MobileAiBookkeeping from './MobileAiBookkeeping.vue'
@@ -174,9 +205,21 @@ const partnerBalance = reactive({
   apply_reconciliation: false,
 })
 const partnerActions = ref([])
+// A message that describes several records produces one editable card per
+// record; the user ticks the ones to book and confirms them in one request.
+const batchDrafts = ref([])
 const partnerEntryRows = ref([])
 const partnerIntent = ref('')
 const parsing = ref(false)
+// Live view of the model working on the current message: which channel is
+// answering, its reasoning summary and the draft as it streams in.
+const thinking = reactive({ active: false, open: true, stage: '', entries: [], seconds: 0 })
+let thinkingTimer = null
+const THINKING_STATUS = {
+  self_check: '草稿信息不完整，正在让模型复核',
+  provider_failed: '该通道没有及时响应，切换到备用通道',
+  local_fallback: 'AI 通道不可用，改用本地规则解析',
+}
 const confirming = ref(false)
 const confirmError = ref('')
 const parseSource = ref('')
@@ -198,6 +241,7 @@ const promptInput = ref(null)
 const conversationThread = ref(null)
 const quickPrompts = [
   { label: '记录一笔支出', text: '今天午餐花了 35 元，微信支付' },
+  { label: '一次记多笔', text: '早餐微信 12 元，午饭支付宝 35 元，晚上打车现金 28 元' },
   { label: '收到一笔款项', text: '今天收到客户货款 3500 元，微信到账' },
   { label: '现金 + 往来', text: '支付宝扫了 1000 元给供应商王先生，供应商网站现在余额 760 元' },
   { label: '记录余额', text: '客户王先生目前未结算余额 12000 元' },
@@ -278,7 +322,15 @@ const partnerCurrentBalance = computed(() => {
 })
 const cashDraftVisible = computed(() => conversation.value.length > 0 && (Boolean(draft.amount) || Boolean(draft.category_id) || Boolean(draft.payment_method_id) || Boolean(draft.transfer_payment_method_id) || Boolean(draft.partner_id) || isTransferDraft.value))
 const partnerDraftVisible = computed(() => conversation.value.length > 0 && (Boolean(draft.partner_id || selectedPartnerId.value) || partnerEntryRows.value.some((row) => row.amount || row.balance_after || row.entry_type)))
-const draftVisible = computed(() => isPartnerMode.value ? partnerDraftVisible.value : cashDraftVisible.value)
+const isBatchMode = computed(() => batchDrafts.value.length > 1)
+const draftVisible = computed(() => !isBatchMode.value && (isPartnerMode.value ? partnerDraftVisible.value : cashDraftVisible.value))
+const selectedBatchDrafts = computed(() => batchDrafts.value.filter((item) => item.selected))
+const batchReady = computed(() => selectedBatchDrafts.value.length > 0 && selectedBatchDrafts.value.every((item) => !batchDraftMissing(item).length))
+const batchProgress = computed(() => {
+  if (!selectedBatchDrafts.value.length) return '请至少勾选一笔需要入账的记录。'
+  const pending = batchDrafts.value.map((item, index) => (item.selected && batchDraftMissing(item).length ? `第 ${index + 1} 笔` : '')).filter(Boolean)
+  return pending.length ? `${pending.join('、')}还有信息需要补充，可以直接在卡片里修改，或继续对话让 AI 补充。` : `已勾选 ${selectedBatchDrafts.value.length} 笔，信息齐全，可以一次确认入账。`
+})
 const cashDraftReady = computed(() => {
   const amount = amountToCents(draft.amount)
   if (!(Number.isInteger(amount) && amount > 0) || !draft.payment_method_id || !['income', 'expense'].includes(draft.direction)) return false
@@ -457,6 +509,70 @@ function inferredProposalMode(raw) {
   if (ledgerType && hasCashFields) return 'combined'
   return 'cash'
 }
+function isTransferItem(item) { return String(item?.kind || '').toLowerCase() === 'transfer' }
+function batchDraftFromRecord(record, index) {
+  const raw = firstObject(record?.parsed, record)
+  const kind = String(field(raw, 'kind')).toLowerCase() === 'transfer' ? 'transfer' : 'cashflow'
+  const amountCents = field(raw, 'amount_cents')
+  const occurred = field(raw, 'occurred_at')
+  return {
+    key: `${Date.now()}-${index}`,
+    selected: true,
+    kind,
+    direction: kind === 'transfer' ? 'expense' : (['income', 'expense'].includes(raw.direction) ? raw.direction : ''),
+    amount: amountCents === '' ? '' : (Number(amountCents) / 100).toFixed(2),
+    occurred_at: occurred ? localDateTimeValue(occurred) : localDateTimeValue(),
+    category_id: kind === 'transfer' ? '' : resolveId(field(raw, 'category_id'), field(raw, 'category_name'), categories.value),
+    payment_method_id: resolveId(field(raw, 'payment_method_id'), field(raw, 'payment_method_name'), paymentMethods.value),
+    transfer_payment_method_id: kind === 'transfer' ? resolveId(field(raw, 'transfer_payment_method_id'), field(raw, 'transfer_payment_method_name'), paymentMethods.value) : '',
+    partner_id: kind === 'transfer' ? '' : resolveId(field(raw, 'partner_id'), field(raw, 'partner_name'), partners.value),
+    notes: String(raw.notes ?? ''),
+  }
+}
+function setBatchDraftType(item, type) {
+  if (type === 'transfer') { Object.assign(item, { kind: 'transfer', direction: 'expense', category_id: '', partner_id: '' }); return }
+  Object.assign(item, { kind: 'cashflow', direction: type, transfer_payment_method_id: '' })
+  // A category belongs to one direction; drop it when the direction flips.
+  const category = categories.value.find((entry) => String(entry.id) === String(item.category_id))
+  if (category?.direction && category.direction !== type) item.category_id = ''
+}
+function categoriesForBatchDraft(item) { return categories.value.filter((entry) => entry.is_active !== false && (!entry.direction || entry.direction === item.direction)) }
+function batchDraftMissing(item) {
+  const missing = []
+  const amount = amountToCents(item.amount)
+  if (!(Number.isInteger(amount) && amount > 0)) missing.push('金额')
+  if (!datetimeLocalToUtcIso(item.occurred_at)) missing.push('发生时间')
+  if (isTransferItem(item)) {
+    if (!item.payment_method_id) missing.push('来源账户')
+    if (!item.transfer_payment_method_id) missing.push('转入/还款账户')
+    else if (String(item.transfer_payment_method_id) === String(item.payment_method_id)) missing.push('不同的目标账户')
+    return missing
+  }
+  if (!['income', 'expense'].includes(item.direction)) missing.push('收支方向')
+  if (!item.category_id) missing.push('分类')
+  if (!item.payment_method_id) missing.push(item.direction === 'income' ? '收款账户' : '支付账户')
+  return missing
+}
+function batchDraftSummary(item) {
+  const methodName = (id) => paymentMethods.value.find((entry) => String(entry.id) === String(id))?.name || ''
+  const amount = amountToCents(item.amount)
+  const money = Number.isInteger(amount) && amount > 0 ? formatMoney(amount) : '金额待补充'
+  if (isTransferItem(item)) return `转账/还款 ${money} · ${methodName(item.payment_method_id) || '来源待选'} → ${methodName(item.transfer_payment_method_id) || '目标待选'}`
+  const label = item.direction === 'income' ? '收入' : item.direction === 'expense' ? '支出' : '方向待定'
+  const category = categories.value.find((entry) => String(entry.id) === String(item.category_id))?.name
+  return [`${label} ${money}`, methodName(item.payment_method_id), category, item.notes].filter(Boolean).join(' · ')
+}
+function applyBatchPayload(payload, records) {
+  // The batch card replaces the single-record card for this turn.
+  resetDraftState()
+  resolvedMode.value = 'cash'
+  batchDrafts.value = records.map(batchDraftFromRecord)
+  parseSource.value = String(payload?.source || '')
+  parseWarning.value = String(payload?.warning || '')
+  briefComment.value = responseBriefComment(payload)
+  const status = responseStatus(payload)
+  pushReviewBubbles(briefComment.value || `我整理出了 ${records.length} 笔记录，请逐笔核对并勾选需要入账的记录。`, status === 'need_more_info' || status === 'incomplete' ? responseQuestion(payload) : '')
+}
 function applyDraft(raw) {
   const amountCents = field(raw, 'amount_cents', 'cents')
   const amount = amountCents !== '' ? (Number(amountCents) / 100).toFixed(2) : field(raw, 'amount', 'value')
@@ -588,6 +704,34 @@ function retryProgress({ error, nextAttempt, maxRetries }) {
   retryStatus.value = `${label}，正在自动重试（${nextAttempt}/${maxRetries + 1}）…`
 }
 
+function startThinking() {
+  const started = Date.now()
+  Object.assign(thinking, { active: true, open: true, stage: '正在连接 AI…', entries: [], seconds: 0 })
+  clearInterval(thinkingTimer)
+  thinkingTimer = setInterval(() => { thinking.seconds = Math.round((Date.now() - started) / 1000) }, 1000)
+}
+function appendThinking(kind, text) {
+  const last = thinking.entries[thinking.entries.length - 1]
+  if (kind !== 'step' && last?.kind === kind) last.text += text
+  else thinking.entries.push({ kind, text, at: thinking.seconds })
+  if (kind === 'step') thinking.stage = text
+}
+function handleParseEvent(event) {
+  const type = String(event?.type || '')
+  if (type === 'provider') appendThinking('step', `${event.name === 'fallback' ? '备用通道' : '主通道'}${event.model ? ` ${event.model}` : ''} 开始处理，等待模型响应`)
+  else if (type === 'start') { if (['reasoning', 'output'].includes(thinking.entries[thinking.entries.length - 1]?.kind)) appendThinking('step', '重新向模型发出请求') }
+  else if (type === 'reasoning' && event.text) { appendThinking('reasoning', String(event.text)); thinking.stage = '模型正在思考…' }
+  else if (type === 'content' && event.text) { appendThinking('output', String(event.text)); thinking.stage = '正在生成记账草稿…' }
+  else if (type === 'status' && THINKING_STATUS[event.code]) appendThinking('step', THINKING_STATUS[event.code])
+}
+// Keep the finished process in the thread, collapsed, so it can be reopened.
+function finishThinking() {
+  if (!thinking.active) return
+  clearInterval(thinkingTimer)
+  thinking.active = false
+  if (thinking.entries.length) conversation.value.push({ role: 'assistant', kind: 'thinking', content: '', entries: thinking.entries.map((entry) => ({ ...entry })), seconds: thinking.seconds, open: false })
+}
+
 function pushReviewBubbles(...contents) {
   conversation.value.push({ role: 'assistant', content: reviewHint })
   contents.filter((content) => String(content || '').trim()).forEach((content) => {
@@ -635,21 +779,28 @@ async function submitPrompt() {
     if (handled) return
     parsingLabel.value = '正在整理这笔记录，完成后向下核对'
     // Earlier Q&A turns are not part of the transaction being described.
-    const priorConversation = priorMessages.filter((message) => message.kind !== 'chat').slice(-12).map(({ role, content }) => ({ role, content }))
+    const priorConversation = priorMessages.filter((message) => !['chat', 'thinking'].includes(message.kind)).slice(-12).map(({ role, content }) => ({ role, content }))
     // Always ask for a unified proposal.  If the returned fields contain only
     // a virtual-account movement, transparently re-run the same sentence in
     // partner mode so the existing partner confirmation contract can be used.
-    let payload = await aiApi.parseMode('combined', { text, conversation: priorConversation, reference_time }, requestOptions)
+    startThinking()
+    const streamOptions = { ...requestOptions, onEvent: handleParseEvent }
+    let payload = await aiApi.parseStream('combined', { text, conversation: priorConversation, reference_time }, streamOptions)
     let raw = responseDraft(payload)
+    const records = Array.isArray(payload?.records) ? payload.records : []
+    if (records.length > 1) { finishThinking(); applyBatchPayload(payload, records); return }
+    batchDrafts.value = []
     let proposalMode = inferredProposalMode(raw)
     if (proposalMode === 'partner') {
-      const partnerPayload = await aiApi.parseMode('partner', { text, conversation: priorConversation, reference_time }, requestOptions)
+      appendThinking('step', '识别为往来余额，按往来模式重新整理')
+      const partnerPayload = await aiApi.parseStream('partner', { text, conversation: priorConversation, reference_time }, streamOptions)
       const partnerRaw = responseDraft(partnerPayload)
       if (Object.keys(partnerRaw).length && (ledgerTypeFromRaw(partnerRaw, '') || field(partnerRaw, 'partner_id', 'partner_name'))) {
         payload = partnerPayload
         raw = partnerRaw
       }
     }
+    finishThinking()
     conversationId.value = payload?.conversation_id || payload?.id || conversationId.value
     parseSource.value = String(payload?.source || '')
     parseWarning.value = String(payload?.warning || '')
@@ -681,6 +832,7 @@ async function submitPrompt() {
     else if (isPartnerMode.value) { pushReviewBubbles('我已识别为往来账户变化，请核对后一次确认。') }
     else { pushReviewBubbles(isTransferDraft.value ? '我已整理好这笔账户转账/还款，请核对来源和目标账户。' : isCombinedMode.value ? '我已同时整理好现金与往来两部分，请核对后一次确认。' : '我已整理好这笔现金记录，请核对后确认。') }
   } catch (error) {
+    finishThinking()
     retryStatus.value = ''
     const presentation = errorPresentation(error)
     requestError.value = presentation
@@ -690,7 +842,8 @@ async function submitPrompt() {
   } finally { parsing.value = false }
 }
 
-function resetConversation() { conversation.value = []; conversationId.value = null; prompt.value = ''; parseSource.value = ''; parseWarning.value = ''; briefComment.value = ''; confirmError.value = ''; retryStatus.value = ''; requestError.value = null; aiUnavailable.value = false; partnerActions.value = []; partnerIntent.value = ''; resolvedMode.value = 'combined'; Object.assign(draftNames, { category: '', method: '', partner: '' }); Object.assign(partnerLedger, { type: '', amount_cents: null, amount_text: '', enabled: false }); Object.assign(partnerBalance, { after_cents: null, after_text: '', expected_cents: null, delta_cents: null, kind: defaultBalanceKindForPartnerType(partnerCurrentType.value), apply_reconciliation: false }); Object.assign(draft, { kind: 'cashflow', direction: 'expense', amount: '', occurred_at: localDateTimeValue(), category_id: '', payment_method_id: '', transfer_payment_method_id: '', partner_id: selectedPartnerId.value || '', notes: '' }); resetPartnerRows(); normalizePartnerSelections() }
+function resetConversation() { conversation.value = []; conversationId.value = null; prompt.value = ''; parseSource.value = ''; parseWarning.value = ''; briefComment.value = ''; confirmError.value = ''; retryStatus.value = ''; requestError.value = null; aiUnavailable.value = false; batchDrafts.value = []; clearInterval(thinkingTimer); Object.assign(thinking, { active: false, stage: '', entries: [], seconds: 0 }); resetDraftState() }
+function resetDraftState() { partnerActions.value = []; partnerIntent.value = ''; resolvedMode.value = 'combined'; Object.assign(draftNames, { category: '', method: '', partner: '' }); Object.assign(partnerLedger, { type: '', amount_cents: null, amount_text: '', enabled: false }); Object.assign(partnerBalance, { after_cents: null, after_text: '', expected_cents: null, delta_cents: null, kind: defaultBalanceKindForPartnerType(partnerCurrentType.value), apply_reconciliation: false }); Object.assign(draft, { kind: 'cashflow', direction: 'expense', amount: '', occurred_at: localDateTimeValue(), category_id: '', payment_method_id: '', transfer_payment_method_id: '', partner_id: selectedPartnerId.value || '', notes: '' }); resetPartnerRows(); normalizePartnerSelections() }
 function normalizedCashDraft() {
   const cents = amountToCents(draft.amount)
   const occurred_at = datetimeLocalToUtcIso(draft.occurred_at)
@@ -745,6 +898,25 @@ function normalizedPartnerEntries() {
     baseBalance = Number.isInteger(after) ? after : baseBalance + sign * amount
   }
   return { partner_id: partnerRef ? Number(partnerRef) : null, partner_name: partnerName, entries }
+}
+async function confirmBatch() {
+  confirmError.value = ''
+  const selected = selectedBatchDrafts.value
+  if (!selected.length) { confirmError.value = '请至少勾选一笔需要入账的记录。'; return }
+  const incomplete = batchDrafts.value.findIndex((item) => item.selected && batchDraftMissing(item).length)
+  if (incomplete >= 0) { confirmError.value = `第 ${incomplete + 1} 笔还需补充：${batchDraftMissing(batchDrafts.value[incomplete]).join('、')}。`; return }
+  const drafts = selected.map((item) => {
+    const transfer = isTransferItem(item)
+    return { occurred_at: datetimeLocalToUtcIso(item.occurred_at), kind: transfer ? 'transfer' : 'cashflow', direction: transfer ? 'expense' : item.direction, amount_cents: amountToCents(item.amount), category_id: transfer ? null : Number(item.category_id), payment_method_id: Number(item.payment_method_id), transfer_payment_method_id: transfer ? Number(item.transfer_payment_method_id) : null, partner_id: !transfer && item.partner_id ? Number(item.partner_id) : null, notes: item.notes || null }
+  })
+  confirming.value = true
+  try {
+    const result = await aiApi.confirmBatch(drafts)
+    const skipped = batchDrafts.value.length - selected.length
+    notice.value = { type: 'success', message: `已确认 ${result?.transactions?.length || drafts.length} 笔记录${skipped ? `，未勾选的 ${skipped} 笔没有入账` : ''}。` }
+    await loadHistory(); resetConversation()
+  } catch (error) { confirmError.value = error instanceof ApiError ? error.message : '确认入账失败，请稍后重试。' }
+  finally { confirming.value = false }
 }
 async function confirmDraft() {
   confirmError.value = ''
@@ -844,9 +1016,12 @@ watch(selectedPartnerId, () => {
 })
 watch(partnerCurrentType, () => { normalizePartnerSelections() })
 onMounted(() => { draft.partner_id = selectedPartnerId.value || ''; loadReferences(); loadHistory() })
+onBeforeUnmount(() => clearInterval(thinkingTimer))
 </script>
 
 <style scoped>
+.parsing-message .ai-thinking,.assistant-message .ai-thinking{margin-top:1px}
+.batch-item{margin-bottom:12px;padding:14px 16px 4px;border:1px solid #e1e9f4;border-radius:11px;background:#fbfcff}.batch-item.is-skipped{padding-bottom:14px;background:#f7f9fc;opacity:.72}.batch-item-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}.batch-item.is-skipped .batch-item-head{margin-bottom:0}.batch-item-check{display:inline-flex;align-items:center;gap:8px;color:#34435b;font-size:13px;cursor:pointer}.batch-item-check input{width:17px;height:17px;accent-color:#2563eb}.batch-item-summary{flex:1;min-width:0;color:#6b7a90;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.batch-item-missing{color:#8a6924;background:#fff4da;border-radius:99px;padding:4px 9px;font-size:11px;font-style:normal}.draft-direction.batch-type{grid-template-columns:repeat(3,1fr)}
 .request-error{display:grid;gap:4px;margin-top:11px;padding:11px 12px;border:1px solid #f1d0d0;border-radius:9px;background:#fff6f6;color:#a33f46;font-size:12px;line-height:1.5}.request-error strong{font-size:12px}.request-error span{color:#8c555b}.request-error small{color:#aa7378}.request-error a{width:max-content;margin-top:2px;color:#2563eb;text-decoration:none;font-weight:600}.request-error.is-backend_unreachable,.request-error.is-timeout{border-color:#f0d9af;background:#fff9ed;color:#88651f}.request-error.is-backend_unreachable span,.request-error.is-timeout span{color:#866d3d}
 .panel{background:#fff;border-radius:13px;box-shadow:0 2px 8px #243b5a0d}.primary{border:0;border-radius:8px;background:#2563eb;color:#fff;padding:10px 17px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}.primary:hover{background:#1d4ed8}.primary:disabled{opacity:.65;cursor:wait}.secondary-link{color:#2563eb;text-decoration:none;font-size:13px;font-weight:600;padding:10px 3px}.ai-chat-header{margin-top:28px;padding:24px;border:1px solid #e1eaf7;box-shadow:0 7px 24px #23436d12}.section-heading{display:flex;align-items:center;gap:12px}.ai-badge{width:38px;height:38px;border-radius:12px;background:#edf4ff;color:#2563eb;display:grid;place-items:center;font-size:19px}.section-heading h2,.panel-title h2{margin:0;color:#34435b;font-size:17px}.section-heading p,.panel-title p{margin:6px 0 0;color:#8a97aa;font-size:12px}.prompt-form{margin-top:18px}.prompt-form textarea{width:100%;min-height:44px;max-height:130px;resize:vertical;border:1px solid #dbe2ee;border-radius:12px;padding:11px 13px;color:#44536a;background:#fbfcff;font:inherit;font-size:14px;outline:0}.prompt-form textarea:focus{border-color:#3b82f6;box-shadow:0 0 0 3px #3b82f61c}.prompt-foot{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-top:11px;color:#98a4b4;font-size:11px}.chat-composer{position:sticky;bottom:14px;z-index:20;margin-top:18px;padding:12px 16px 14px;border:1px solid #d8e6f8;box-shadow:0 10px 28px #23436d1b}.chat-composer .prompt-form{margin-top:0}.chat-send{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border:0;border-radius:50%;background:#2563eb;color:#fff;font-size:23px;line-height:1;cursor:pointer;box-shadow:0 4px 10px #2563eb38}.chat-send:disabled{opacity:.45;cursor:wait;box-shadow:none}.chat-send .spinner{margin:0;width:16px;height:16px}.fallback-hint{margin-top:11px;background:#fff8e7;color:#8a6924;padding:10px 12px;border-radius:8px;font-size:12px}.fallback-hint a{color:#2563eb;margin-left:4px;text-decoration:none}.parse-result-meta{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:12px;padding-top:12px;border-top:1px solid #edf1f6}.parse-source-badge{display:inline-flex;align-items:center;gap:6px;padding:5px 8px;border-radius:99px;background:#edf5ff;color:#2563eb;font-size:10px;font-weight:600;white-space:nowrap}.parse-source-badge i{width:6px;height:6px;border-radius:50%;background:#2563eb}.parse-source-badge.is-fallback{background:#f1f3f6;color:#64748b}.parse-source-badge.is-fallback i{background:#94a3b8}.parse-warning-text{color:#8a6924;font-size:11px;line-height:1.45}.conversation,.confirm-card,.history{margin-top:18px;overflow:hidden}.panel-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:20px 24px;border-bottom:1px solid #edf0f5}.text-button{border:0;background:transparent;color:#2563eb;font-size:12px;cursor:pointer;padding:4px}.messages{padding:18px 24px 21px;display:grid;gap:12px}.message{display:flex;gap:9px;align-items:flex-start;max-width:85%}.message-avatar{width:27px;height:27px;flex:0 0 27px;border-radius:9px;display:grid;place-items:center;font-size:11px;font-weight:600}.assistant-message .message-avatar{color:#2563eb;background:#edf4ff}.user-message{margin-left:auto;flex-direction:row-reverse;scroll-margin-top:20px}.user-message .message-avatar{color:#52617a;background:#eef2f8}.message p{margin:0;border-radius:11px;padding:10px 12px;color:#53627a;background:#f6f8fb;font-size:13px;line-height:1.6}.user-message p{color:#fff;background:#2563eb}.parsing-message p{display:inline-flex;align-items:center;gap:8px;color:#7e8da4}.typing-dots{display:inline-flex;gap:3px;align-items:center}.typing-dots i{width:5px;height:5px;border-radius:50%;background:#8ba5ce;animation:typing-dot 1.1s infinite ease-in-out}.typing-dots i:nth-child(2){animation-delay:.15s}.typing-dots i:nth-child(3){animation-delay:.3s}@keyframes typing-dot{0%,60%,100%{opacity:.35;transform:translateY(0)}30%{opacity:1;transform:translateY(-2px)}}.confirm-card{padding-bottom:22px}.draft-status{color:#8a6924;background:#fff4da;border-radius:99px;padding:5px 8px;font-size:11px}.warning{margin:16px 24px 0;border-radius:8px;padding:10px 12px;background:#fff8e7;color:#8a6924;font-size:12px}.draft-form{padding:18px 24px 0}.draft-direction{display:grid;grid-template-columns:1fr 1fr;gap:5px;padding:4px;background:#f1f5fb;border-radius:10px}.draft-direction button{border:0;border-radius:7px;padding:9px;background:transparent;color:#7c8ba1;cursor:pointer;font-size:13px}.draft-direction button.selected{background:#fff;color:#2563eb;box-shadow:0 1px 5px #263b6114;font-weight:600}.draft-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}.draft-grid label{display:block;color:#59677d;font-size:13px;margin:14px 0}.draft-grid input,.draft-grid select,.draft-grid textarea{display:block;width:100%;margin-top:6px;border:1px solid #dbe2ee;border-radius:8px;padding:10px;color:#44536a;background:#fff;font:inherit;font-size:13px;outline:0}.draft-grid input:focus,.draft-grid select,.draft-grid textarea:focus{border-color:#3b82f6}.partner-ledger-confirm{margin-top:13px;border:1px solid #dbe6f5;border-radius:9px;background:#f8fbff;padding:12px}.ledger-toggle{display:flex;align-items:center;gap:8px;color:#42536c;font-size:13px;font-weight:600}.ledger-toggle input{accent-color:#2563eb}.ledger-hint{margin:8px 0 0;color:#9a6d26;font-size:12px}.ledger-fields{display:flex;align-items:center;gap:12px;margin-top:10px}.ledger-fields label{color:#59677d;font-size:12px;flex:0 1 220px}.ledger-fields select{display:block;width:100%;margin-top:5px;border:1px solid #dbe2ee;border-radius:8px;padding:8px;color:#44536a;background:#fff;font:inherit;font-size:12px}.ledger-preview{color:#53627a;font-size:12px;white-space:nowrap}.confirm-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:8px}.outline-button{border:1px solid #d6dfec;border-radius:8px;background:#fff;color:#52617a;padding:9px 15px;cursor:pointer;font-size:13px}.form-error{margin-top:13px;color:#a83232;background:#fff0f0;border-radius:8px;padding:10px 12px;font-size:13px}.history-state{min-height:130px;display:grid;place-content:center;justify-items:center;text-align:center;color:#8b98aa;padding:20px}.history-state p{margin:7px 0;font-size:13px}.error-state{color:#ba4b53}.history-list{list-style:none;padding:0 24px;margin:0}.history-list li{display:flex;align-items:flex-start;gap:11px;padding:15px 0;border-bottom:1px solid #edf0f5}.history-list li:last-child{border-bottom:0}.history-icon{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;color:#2563eb;background:#edf4ff;font-size:14px}.history-content{min-width:0;flex:1}.history-content strong{display:block;color:#53627a;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.history-content span{display:block;color:#a0aaba;font-size:10px;margin-top:4px}.history-content p{margin:6px 0 0;color:#7d8ba0;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.history-status{border-radius:99px;padding:4px 7px;font-size:10px;white-space:nowrap}.history-ok{color:#12845e;background:#e7f8f0}.history-error{color:#c84d54;background:#fff0f0}.spinner{width:16px;height:16px;border:2px solid #ffffff66;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;display:inline-block;vertical-align:-3px;margin-right:5px}.spinner.dark{border-color:#dce7f8;border-top-color:#2563eb;margin:0 0 5px}@keyframes spin{to{transform:rotate(360deg)}}
 @media(max-width:620px){.ai-chat-header{margin-top:20px;padding:18px 16px}.prompt-foot{align-items:flex-end;flex-direction:row}.prompt-foot .chat-send{width:42px}.panel-title{padding:17px 16px}.messages,.draft-form{padding-left:16px;padding-right:16px}.message{max-width:95%}.draft-grid{grid-template-columns:1fr}.ledger-fields{align-items:stretch;flex-direction:column;gap:5px}.ledger-preview{white-space:normal}.history-list{padding:0 16px}.history-content p{white-space:normal}.secondary-link{font-size:11px}.chat-composer{bottom:8px;margin-left:0;margin-right:0;padding:10px 12px 11px}.chat-composer .prompt-form textarea{min-height:42px}.chat-composer .quick-prompts{overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none}.chat-composer .quick-prompts::-webkit-scrollbar{display:none}.chat-composer .quick-prompts button{white-space:nowrap}}
