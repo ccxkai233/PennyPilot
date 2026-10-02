@@ -10,7 +10,7 @@
 
     <section class="filters panel" aria-label="流水筛选">
       <div class="filter-row">
-        <label class="filter-field"><span>方向</span><select v-model="filters.direction" @change="loadTransactions"><option value="">全部收支</option><option value="income">收入</option><option value="expense">支出</option></select></label>
+        <label class="filter-field"><span>类型</span><select v-model="filters.direction" @change="loadTransactions"><option value="">全部类型</option><option value="income">收入</option><option value="expense">支出</option><option value="transfer">转账/还款</option></select></label>
         <label class="filter-field"><span>开始日期</span><input v-model="filters.from" type="date" @change="loadTransactions" /></label>
         <label class="filter-field"><span>结束日期</span><input v-model="filters.to" type="date" @change="loadTransactions" /></label>
         <label class="filter-field"><span>分类</span><select v-model="filters.category_id" @change="loadTransactions"><option value="">全部分类</option><option v-for="category in visibleCategories" :key="category.id" :value="category.id">{{ category.name }}</option></select></label>
@@ -50,7 +50,7 @@
                 <td data-label="往来账户">{{ transaction.partner_name || '—' }}</td>
                 <td data-label="备注" class="notes-cell" :title="transaction.notes || transaction.note">{{ transaction.notes || transaction.note || '—' }}</td>
                 <td data-label="状态"><span class="status" :class="isVoided(transaction) ? 'status-voided' : 'status-normal'">{{ isVoided(transaction) ? '已作废' : '正常' }}</span></td>
-                <td data-label="操作" class="actions-cell"><button type="button" class="text-button" :disabled="isVoided(transaction) || isTransfer(transaction)" @click="openEdit(transaction)">编辑</button><button type="button" class="text-button danger" :disabled="isVoided(transaction)" @click="voidTransaction(transaction)">作废</button></td>
+                <td data-label="操作" class="actions-cell"><button type="button" class="text-button" :disabled="isVoided(transaction)" @click="openEdit(transaction)">编辑</button><button type="button" class="text-button danger" :disabled="isVoided(transaction)" @click="voidTransaction(transaction)">作废</button></td>
               </tr>
             </tbody>
           </table>
@@ -61,19 +61,21 @@
     <Teleport to="body">
       <div v-if="modalOpen" class="modal-backdrop" @click.self="closeModal">
         <section class="modal" role="dialog" aria-modal="true" :aria-labelledby="editing ? 'edit-title' : 'create-title'">
-          <div class="modal-header"><div><h2 :id="editing ? 'edit-title' : 'create-title'">{{ editing ? '编辑收支' : '手动记账' }}</h2><p>金额以元填写，系统将按分保存</p></div><div class="modal-header-actions"><router-link v-if="!editing" class="manual-ai-link" to="/ai" @click="closeModal">改用 AI</router-link><button class="modal-close" type="button" aria-label="关闭" @click="closeModal">×</button></div></div>
+          <div class="modal-header"><div><h2 :id="editing ? 'edit-title' : 'create-title'">{{ editing ? (isTransferForm ? '编辑转账' : '编辑收支') : '手动记账' }}</h2><p>{{ isTransferForm ? '转账/还款只在账户之间移动余额，不计入收入或支出' : '金额以元填写，系统将按分保存' }}</p></div><div class="modal-header-actions"><router-link v-if="!editing" class="manual-ai-link" to="/ai" @click="closeModal">改用 AI</router-link><button class="modal-close" type="button" aria-label="关闭" @click="closeModal">×</button></div></div>
           <div v-if="formError" class="form-error" role="alert">{{ formError }}</div>
           <form class="transaction-form" @submit.prevent="saveTransaction">
-            <div class="direction-toggle" role="radiogroup" aria-label="收支方向"><button type="button" :class="{ selected: form.direction === 'expense' }" @click="form.direction = 'expense'">支出</button><button type="button" :class="{ selected: form.direction === 'income' }" @click="form.direction = 'income'">收入</button></div>
+            <div class="direction-toggle" role="radiogroup" aria-label="流水类型"><button type="button" :class="{ selected: formType === 'expense' }" @click="setFormType('expense')">支出</button><button type="button" :class="{ selected: formType === 'income' }" @click="setFormType('income')">收入</button><button type="button" :class="{ selected: formType === 'transfer' }" @click="setFormType('transfer')">转账/还款</button></div>
+            <p v-if="isTransferForm" class="transfer-hint">来源账户余额减少；转入信用卡、花呗等负债账户时欠款减少，转入现金或投资账户时余额增加。</p>
             <label>金额（元）<input v-model="form.amount" inputmode="decimal" pattern="^[0-9]+([.][0-9]{1,2})?$" placeholder="0.00" required /></label>
             <label>发生时间<input v-model="form.occurred_at" type="datetime-local" required /></label>
             <div class="form-grid">
-              <label>分类<select v-model="form.category_id" required><option value="" disabled>请选择分类</option><option v-for="category in formCategories" :key="category.id" :value="String(category.id)">{{ category.name }}</option></select></label>
-              <label>{{ form.direction === 'income' ? '收款账户' : '支付账户' }}<select v-model="form.payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="method in formPaymentMethods" :key="method.id" :value="String(method.id)">{{ paymentMethodOptionLabel(method) }}</option></select></label>
-              <label>往来账户（可选）<select v-model="form.partner_id"><option value="">不关联</option><option v-for="partner in partners" :key="partner.id" :value="String(partner.id)">{{ partner.name }}</option></select></label>
+              <label v-if="!isTransferForm">分类<select v-model="form.category_id" required><option value="" disabled>请选择分类</option><option v-for="category in formCategories" :key="category.id" :value="String(category.id)">{{ category.name }}</option></select></label>
+              <label>{{ isTransferForm ? '来源账户' : form.direction === 'income' ? '收款账户' : '支付账户' }}<select v-model="form.payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="method in formPaymentMethods" :key="method.id" :value="String(method.id)">{{ paymentMethodOptionLabel(method) }}</option></select></label>
+              <label v-if="isTransferForm">转入/还款账户<select v-model="form.transfer_payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="method in formPaymentMethods" :key="method.id" :value="String(method.id)" :disabled="String(method.id) === String(form.payment_method_id)">{{ paymentMethodOptionLabel(method) }}</option></select></label>
+              <label v-else>往来账户（可选）<select v-model="form.partner_id"><option value="">不关联</option><option v-for="partner in partners" :key="partner.id" :value="String(partner.id)">{{ partner.name }}</option></select></label>
             </div>
             <label>备注（可选）<textarea v-model.trim="form.notes" rows="3" maxlength="500" placeholder="补充说明…"></textarea></label>
-            <div class="modal-actions"><button class="outline-button" type="button" @click="closeModal">取消</button><button class="primary" type="submit" :disabled="saving"><span v-if="saving" class="spinner"></span>{{ saving ? '保存中…' : (editing ? '保存修改' : '确认入账') }}</button></div>
+            <div class="modal-actions"><button class="outline-button" type="button" @click="closeModal">取消</button><button class="primary" type="submit" :disabled="saving"><span v-if="saving" class="spinner"></span>{{ saving ? '保存中…' : (editing ? '保存修改' : isTransferForm ? '确认转账' : '确认入账') }}</button></div>
           </form>
         </section>
       </div>
@@ -116,13 +118,19 @@ const notice = ref(null)
 const route = useRoute()
 const router = useRouter()
 const filters = reactive({ direction: '', from: '', to: '', category_id: '', payment_method_id: '', partner_id: String(route.query.partner_id || '') })
-const form = reactive({ direction: 'expense', amount: '', occurred_at: localDateTimeValue(), category_id: '', payment_method_id: '', partner_id: '', notes: '' })
+const form = reactive({ kind: 'cashflow', direction: 'expense', amount: '', occurred_at: localDateTimeValue(), category_id: '', payment_method_id: '', transfer_payment_method_id: '', partner_id: '', notes: '' })
 const { isMobile } = useViewport()
 const { confirmDialog, requestConfirm, resolveConfirm } = useConfirmDialog()
 
 const visibleCategories = computed(() => categories.value.filter((category) => category.is_active !== false))
 const formPaymentMethods = computed(() => paymentMethods.value.filter((method) => method.is_active !== false))
 const formCategories = computed(() => visibleCategories.value.filter((category) => !category.direction || category.direction === form.direction))
+const isTransferForm = computed(() => form.kind === 'transfer')
+const formType = computed(() => (isTransferForm.value ? 'transfer' : form.direction))
+function setFormType(type) {
+  if (type === 'transfer') { form.kind = 'transfer'; form.direction = 'expense'; form.category_id = ''; form.partner_id = ''; return }
+  form.kind = 'cashflow'; form.direction = type; form.transfer_payment_method_id = ''
+}
 const subtitle = computed(() => `共 ${transactions.value.length} 笔记录`)
 const summary = computed(() => {
   const cashflow = transactions.value.filter((item) => !isTransfer(item))
@@ -139,13 +147,13 @@ function paymentMethodOptionLabel(method) { return `${method.name}${method.accou
 
 function normalizeForm(transaction = null) {
   if (!transaction) {
-    Object.assign(form, { direction: 'expense', amount: '', occurred_at: localDateTimeValue(), category_id: '', payment_method_id: '', partner_id: '', notes: '' })
+    Object.assign(form, { kind: 'cashflow', direction: 'expense', amount: '', occurred_at: localDateTimeValue(), category_id: '', payment_method_id: '', transfer_payment_method_id: '', partner_id: '', notes: '' })
     return
   }
   Object.assign(form, {
-    direction: transaction.direction || 'expense', amount: (transactionCents(transaction) / 100).toFixed(2),
+    kind: isTransfer(transaction) ? 'transfer' : 'cashflow', direction: isTransfer(transaction) ? 'expense' : (transaction.direction || 'expense'), amount: (transactionCents(transaction) / 100).toFixed(2),
     occurred_at: localDateTimeValue(transaction.occurred_at || transaction.occurred_time),
-    category_id: String(transaction.category_id ?? transaction.category?.id ?? ''), payment_method_id: String(transaction.payment_method_id ?? transaction.payment_method?.id ?? ''), partner_id: String(transaction.partner_id ?? transaction.partner?.id ?? ''),
+    category_id: String(transaction.category_id ?? transaction.category?.id ?? ''), payment_method_id: String(transaction.payment_method_id ?? transaction.payment_method?.id ?? ''), transfer_payment_method_id: String(transaction.transfer_payment_method_id ?? transaction.transfer_payment_method?.id ?? ''), partner_id: String(transaction.partner_id ?? transaction.partner?.id ?? ''),
     notes: transaction.notes ?? transaction.note ?? '',
   })
 }
@@ -162,7 +170,9 @@ async function loadDictionaries() {
 async function loadTransactions() {
   loading.value = true; errorMessage.value = ''
   try {
-    const rows = await transactionsApi.list({ ...filters, include_voided: true, page_size: 100 })
+    const { direction, ...rest } = filters
+    const typeFilter = direction === 'transfer' ? { kind: 'transfer' } : { direction }
+    const rows = await transactionsApi.list({ ...rest, ...typeFilter, include_voided: true, page_size: 100 })
     transactions.value = rows.map((item) => ({
       ...item,
       category_name: item.category_name || item.category?.name || categories.value.find((category) => String(category.id) === String(item.category_id))?.name,
@@ -186,10 +196,6 @@ function paymentMethodName(transaction) {
 function resetFilters() { Object.assign(filters, { direction: '', from: '', to: '', category_id: '', payment_method_id: '', partner_id: '' }); loadTransactions() }
 function openCreate() { editing.value = null; formError.value = ''; normalizeForm(); modalOpen.value = true }
 function openEdit(transaction) {
-  if (isTransfer(transaction)) {
-    notice.value = { type: 'error', message: '转账/还款流水暂不支持在普通表单编辑，请作废后重新记录。' }
-    return
-  }
   editing.value = transaction; formError.value = ''; normalizeForm(transaction); modalOpen.value = true
 }
 function closeModal() { if (!saving.value) modalOpen.value = false }
@@ -214,16 +220,21 @@ async function saveTransaction() {
   formError.value = ''
   const amount_cents = amountToCents(form.amount)
   if (!Number.isInteger(amount_cents) || amount_cents <= 0) { formError.value = '请输入大于 0 且最多两位小数的金额。'; return }
-  if (!form.category_id || !form.payment_method_id) { formError.value = '请选择分类和资金账户。'; return }
+  if (isTransferForm.value) {
+    if (!form.payment_method_id || !form.transfer_payment_method_id) { formError.value = '请选择来源账户和转入/还款账户。'; return }
+    if (String(form.payment_method_id) === String(form.transfer_payment_method_id)) { formError.value = '来源账户和转入/还款账户不能相同。'; return }
+  } else if (!form.category_id || !form.payment_method_id) { formError.value = '请选择分类和资金账户。'; return }
   const occurred_at = datetimeLocalToUtcIso(form.occurred_at)
   if (!occurred_at) { formError.value = '请输入有效的北京时间。'; return }
   saving.value = true
-  const data = { direction: form.direction, amount_cents, occurred_at, category_id: Number(form.category_id), payment_method_id: Number(form.payment_method_id), partner_id: form.partner_id ? Number(form.partner_id) : null, notes: form.notes || null, source: editing.value?.source || 'manual' }
+  const data = isTransferForm.value
+    ? { kind: 'transfer', direction: 'expense', amount_cents, occurred_at, category_id: null, payment_method_id: Number(form.payment_method_id), transfer_payment_method_id: Number(form.transfer_payment_method_id), partner_id: null, notes: form.notes || null, source: editing.value?.source || 'manual' }
+    : { kind: 'cashflow', direction: form.direction, amount_cents, occurred_at, category_id: Number(form.category_id), payment_method_id: Number(form.payment_method_id), transfer_payment_method_id: null, partner_id: form.partner_id ? Number(form.partner_id) : null, notes: form.notes || null, source: editing.value?.source || 'manual' }
   try {
     if (editing.value) await transactionsApi.update(editing.value.id, data)
     else await transactionsApi.create(data)
     modalOpen.value = false
-    notice.value = { type: 'success', message: editing.value ? '交易已更新。' : '交易已入账。' }
+    notice.value = { type: 'success', message: editing.value ? '交易已更新。' : isTransferForm.value ? '转账/还款已记录，账户余额已更新。' : '交易已入账。' }
     await loadTransactions()
   } catch (error) { formError.value = error instanceof ApiError ? error.message : '保存失败，请稍后重试。' }
   finally { saving.value = false }
@@ -252,7 +263,7 @@ onMounted(async () => {
 .summary-row { display: flex; align-items: center; gap: 30px; padding: 20px 2px 16px; }.summary-item { display: flex; align-items: baseline; gap: 9px; }.summary-item span { color: #8996a9; font-size: 12px; }.summary-item strong { font-size: 16px; }.summary-count { margin-left: auto; color: #8996a9; font-size: 12px; }.income-text { color: #12966a; }.expense-text { color: #dc5a61; }.transfer-text { color: #64748b; }
 .table-panel { overflow: hidden; min-height: 330px; }.table-wrap { overflow-x: auto; }table { width: 100%; border-collapse: collapse; min-width: 900px; }th { background: #fafbfd; color: #8996a9; font-size: 11px; font-weight: 600; text-align: left; padding: 13px 18px; white-space: nowrap; }td { border-top: 1px solid #edf0f5; color: #516078; font-size: 13px; padding: 15px 18px; vertical-align: middle; }tr:hover td { background: #fcfdff; }.time-cell { color: #77869b; white-space: nowrap; }.amount-cell { font-weight: 700; white-space: nowrap; }.notes-cell { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.direction, .status { display: inline-flex; align-items: center; border-radius: 99px; padding: 4px 8px; font-size: 11px; white-space: nowrap; }.income-badge { color: #12845e; background: #e7f8f0; }.expense-badge { color: #c84d54; background: #fff0f0; }.transfer-badge { color: #526d99; background: #eff4fb; }.status-normal { color: #4f6c91; background: #eff4fb; }.status-voided { color: #9aa4b2; background: #f1f3f5; }.voided td { color: #a3acb8; }.actions-cell { white-space: nowrap; }.text-button { border: 0; background: transparent; padding: 3px 5px; color: #2563eb; font-size: 12px; cursor: pointer; }.text-button.danger { color: #d65b62; }.text-button:disabled { color: #b4bdc9; cursor: not-allowed; }.action-col { width: 105px; }
 .state { min-height: 330px; display: grid; place-content: center; justify-items: center; text-align: center; color: #8b98aa; padding: 30px; }.state h3 { color: #52617a; margin: 14px 0 6px; font-size: 16px; }.state p { margin: 0 0 17px; font-size: 13px; }.empty-icon { font-size: 34px; }.empty-actions { display: flex; align-items: center; justify-content: center; gap: 9px; flex-wrap: wrap; }.error-state p { color: #ba4b53; }.outline-button { border: 1px solid #d6dfec; border-radius: 8px; background: #fff; color: #52617a; padding: 9px 16px; cursor: pointer; font-size: 13px; }.outline-button:hover { border-color: #3b82f6; color: #2563eb; }.outline-button.small, .primary.small { min-height: 40px; }.spinner { width: 18px; height: 18px; border: 2px solid #dce7f8; border-top-color: #2563eb; border-radius: 50%; animation: spin .7s linear infinite; }.spinner.dark { margin-bottom: 10px; }
-.modal-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 18px; background: #10213c66; }.modal { width: min(550px, 100%); max-height: min(760px, calc(100vh - 36px)); overflow: auto; background: #fff; border-radius: 16px; box-shadow: 0 24px 80px #0c1c3560; padding: 26px; }.modal-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }.modal-header h2 { margin: 0; color: #1e2a3d; font-size: 21px; }.modal-header p { color: #8996a9; margin: 6px 0 0; font-size: 12px; }.modal-header-actions { display: flex; align-items: center; gap: 8px; }.manual-ai-link { display: inline-flex; align-items: center; min-height: 36px; color: #2563eb; font-size: 12px; text-decoration: none; white-space: nowrap; }.modal-close { border: 0; background: transparent; color: #8b98aa; font-size: 26px; line-height: 1; cursor: pointer; }.form-error { margin-top: 17px; color: #a83232; background: #fff0f0; border-radius: 8px; padding: 10px 12px; font-size: 13px; }.transaction-form { margin-top: 17px; }.direction-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; padding: 4px; border-radius: 10px; background: #f1f5fb; margin-bottom: 3px; }.direction-toggle button { border: 0; border-radius: 7px; background: transparent; color: #7c8ba1; padding: 9px; cursor: pointer; font-size: 13px; }.direction-toggle button.selected { background: #fff; color: #2563eb; box-shadow: 0 1px 5px #263b6114; font-weight: 600; }.transaction-form label { display: block; color: #59677d; font-size: 13px; margin: 15px 0; }.transaction-form input, .transaction-form select, .transaction-form textarea { display: block; width: 100%; margin-top: 7px; border: 1px solid #dbe2ee; border-radius: 8px; padding: 10px 11px; color: #44536a; background: #fff; font: inherit; font-size: 13px; outline: none; }.transaction-form input:focus, .transaction-form select:focus, .transaction-form textarea:focus { border-color: #3b82f6; }.transaction-form textarea { resize: vertical; }.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }.modal-actions .primary { min-width: 110px; }.modal-actions .spinner { display: inline-block; width: 14px; height: 14px; border-color: #ffffff66; border-top-color: #fff; vertical-align: -2px; }
+.modal-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 18px; background: #10213c66; }.modal { width: min(550px, 100%); max-height: min(760px, calc(100vh - 36px)); overflow: auto; background: #fff; border-radius: 16px; box-shadow: 0 24px 80px #0c1c3560; padding: 26px; }.modal-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }.modal-header h2 { margin: 0; color: #1e2a3d; font-size: 21px; }.modal-header p { color: #8996a9; margin: 6px 0 0; font-size: 12px; }.modal-header-actions { display: flex; align-items: center; gap: 8px; }.manual-ai-link { display: inline-flex; align-items: center; min-height: 36px; color: #2563eb; font-size: 12px; text-decoration: none; white-space: nowrap; }.modal-close { border: 0; background: transparent; color: #8b98aa; font-size: 26px; line-height: 1; cursor: pointer; }.form-error { margin-top: 17px; color: #a83232; background: #fff0f0; border-radius: 8px; padding: 10px 12px; font-size: 13px; }.transaction-form { margin-top: 17px; }.direction-toggle { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; padding: 4px; border-radius: 10px; background: #f1f5fb; margin-bottom: 3px; }.direction-toggle button { border: 0; border-radius: 7px; background: transparent; color: #7c8ba1; padding: 9px; cursor: pointer; font-size: 13px; }.direction-toggle button.selected { background: #fff; color: #2563eb; box-shadow: 0 1px 5px #263b6114; font-weight: 600; }.transfer-hint { margin: 0 0 4px; padding: 10px 11px; border: 1px solid #dbe6f5; border-radius: 8px; background: #f8fbff; color: #596b84; font-size: 12px; line-height: 1.5; }.transaction-form label { display: block; color: #59677d; font-size: 13px; margin: 15px 0; }.transaction-form input, .transaction-form select, .transaction-form textarea { display: block; width: 100%; margin-top: 7px; border: 1px solid #dbe2ee; border-radius: 8px; padding: 10px 11px; color: #44536a; background: #fff; font: inherit; font-size: 13px; outline: none; }.transaction-form input:focus, .transaction-form select:focus, .transaction-form textarea:focus { border-color: #3b82f6; }.transaction-form textarea { resize: vertical; }.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }.modal-actions .primary { min-width: 110px; }.modal-actions .spinner { display: inline-block; width: 14px; height: 14px; border-color: #ffffff66; border-top-color: #fff; vertical-align: -2px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (max-width: 700px) { .summary-row { gap: 15px; flex-wrap: wrap; }.summary-count { width: 100%; margin-left: 0; }.filters { margin-top: 20px; }.filter-field { flex-basis: calc(50% - 6px); }.table-panel { border-radius: 10px; } }
 @media (max-width: 540px) { .add-button { padding: 9px 11px; font-size: 12px; }.filter-field { flex-basis: 100%; }.modal { padding: 21px 17px; }.form-grid { grid-template-columns: 1fr; gap: 0; } }
