@@ -238,7 +238,7 @@ class AIConfirmResponse(BaseModel):
 class AIAnalyzeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    period: Literal["day", "week", "month", "custom"] = "month"
+    period: Literal["day", "week", "month", "year", "all", "custom"] = "month"
     start_date: date | None = None
     end_date: date | None = None
     save_history: bool = True
@@ -273,3 +273,61 @@ class AIAnalyzeResponse(BaseModel):
 
 class AIReportRead(AIAnalyzeResponse):
     pass
+
+
+class AIPeriodInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["day", "week", "month", "year", "all", "custom"]
+    label: str
+    start_date: date | None = None
+    end_date: date
+
+
+class AISummaryResponse(BaseModel):
+    """Aggregated cash-flow figures for one period (no model call)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    period: AIPeriodInfo
+    summary: dict
+
+
+class AIChatRequest(BaseModel):
+    """A conversational message that may be a bookkeeping sentence or a question.
+
+    The endpoint only answers ledger questions and report requests.  A
+    bookkeeping sentence is reported back as ``intent=bookkeeping`` so the
+    client continues with the strict parse/confirm flow; nothing is written.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=4000)
+    conversation: list[AIConversationMessage] = Field(default_factory=list, max_length=12)
+    reference_time: datetime | None = None
+    # Optional explicit period override from the client (for quick actions).
+    period: Literal["day", "week", "month", "year", "all", "custom"] | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    save_history: bool = True
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def trim_text(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+        return value
+
+
+class AIChatResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intent: Literal["bookkeeping", "query", "report"]
+    reply: str | None = Field(default=None, max_length=100_000)
+    period: AIPeriodInfo | None = None
+    summary: dict | None = None
+    report_id: int | None = None
+    source: Literal["model", "fallback"] | None = None
+    model: str | None = None
+    warning: str | None = Field(default=None, max_length=300)

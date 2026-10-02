@@ -230,7 +230,13 @@ AI 配置使用 `GET/PUT (或 PATCH) /api/ai/config`，API Key 以 Fernet 密文
 `POST /api/ai/parse` 只生成解析草稿，`POST /api/ai/confirm` 要求请求体中的 `confirm: true`，
 并在字段校验通过后才写入交易；可选的往来流水也会与交易原子提交。无可用模型或模型响应不符合
 严格 schema 时，接口会返回带 warning 的本地规则草稿，不会自动入账。`POST /api/ai/analyze` 生成
-日/周/月/自定义周期报告，`GET /api/ai/reports` 和 `/api/ai/reports/{id}` 用于历史回看。
+日/周/月/年/全部/自定义周期报告，`GET /api/ai/reports` 和 `/api/ai/reports/{id}` 用于历史回看。
+
+`GET /api/ai/summary?period=month|year|all|day|week|custom` 返回按北京日期聚合的收支数据（总额、分类、
+每日/每月桶、上一周期对比、大额交易），财务分析页的本月图表直接使用该接口，不会调用模型。
+`POST /api/ai/chat` 是对话式账本助手：先用本地规则判断意图，记账句子返回 `intent=bookkeeping` 让前端
+继续走 parse/confirm 流程；询问“本月/本年/全部收支怎么样”会返回基于聚合数据的回答，要求“生成收支报告”
+时会生成报告并保存到分析历史（`report_id`）。模型只接收聚合数字，未配置模型时用本地文本回答。
 
 每日结算接口为 `GET /api/settlements`（支持 `start_date`、`end_date` 和分页）、
 `GET /api/settlements/{YYYY-MM-DD}`、`POST /api/settlements/run` 和

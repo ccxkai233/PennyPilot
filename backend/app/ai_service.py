@@ -1732,3 +1732,89 @@ class AIService:
                 continue
             warning = "AI 主通道和备用通道均不可用，已生成本地分析。" if len(providers) > 1 else ("未配置 AI 服务，已生成本地分析。" if last_error and last_error.code == "not_configured" else "AI 服务暂不可用，已生成本地分析。")
             return self.fallback_report(summary, start, end), "fallback", warning, None
+
+    CHAT_MAX_TOKENS = 2_048
+
+    def chat_reply(
+        self,
+        db: Session,
+        user_id: int,
+        text_value: str,
+        conversation: list[dict[str, str]] | None,
+        summary: dict[str, Any],
+        intent: str,
+    ) -> tuple[str, str, str | None, str | None]:
+        """Answer a ledger question or write a report from aggregated figures.
+
+        The model only ever sees aggregated numbers, category names and the
+        short notes of the largest transactions; it never receives raw rows or
+        provider credentials.  Returns ``(content, source, warning, model)``
+        and falls back to the deterministic text when no provider answers.
+        """
+
+        from .ai_insights import fallback_answer, fallback_report
+
+        providers = self.provider_chain_for_user(db, user_id)
+        period = summary.get("period", {})
+        label = period.get("label", "该周期")
+        today = to_business(now_utc()).date().isoformat()
+        common = (
+            "你是 PennyPilot 记账应用的财务助手，只根据下面提供的聚合数据回答用户关于账本的问题。"
+            f"当前北京日期是 {today}。数据周期：{label}"
+            f"（{period.get('start_date') or '最早记录'} 至 {period.get('end_date')}）。"
+            "所有金额字段以“分”为单位（*_cents），回答时必须换算成元并保留两位小数，例如 123456 分 = 1,234.56 元。"
+            "share 是占比（0-1 之间的小数），请以百分比表达。previous/change 表示与上一周期的对比；"
+            "days_elapsed 小于 days_total 说明本周期尚未结束，做对比时要说明这一点。"
+            "不要编造数据中没有的数字或交易；数据为空时如实说明没有记录。"
+            "输出纯文本，不要使用 Markdown 标记（如 #、*、|、```），可以用换行和“•”列表。"
+        )
+        if intent == "report":
+            instruction = (
+                "用户要求生成一份收支报告。请输出结构化的中文报告，按顺序包含：总览（笔数、收入、支出、净收支）、"
+                "收入结构、支出结构（含占比）、趋势或对比（有 daily/monthly/previous 数据时）、大额支出、2-3 条可执行建议。"
+                "标题用“【周期 收支报告】”形式，各部分用短标题分段，总长度不超过 1200 字。"
+            )
+        else:
+            instruction = (
+                "用户在询问账本情况。请用简洁、自然的中文直接回答问题，优先给出与问题最相关的数字，"
+                "必要时补充 1-2 句有价值的观察（如占比最高的分类、与上期的变化）。回答不超过 300 字，不要输出报告格式。"
+            )
+        system = common + instruction + "\n聚合数据：" + json.dumps(summary, ensure_ascii=False)
+        messages = [{"role": "system", "content": system}]
+        for item in (conversation or [])[-MAX_CONVERSATION_MESSAGES:]:
+            if item.get("role") in {"user", "assistant"} and isinstance(item.get("content"), str) and item["content"].strip():
+                messages.append({"role": item["role"], "content": item["content"][:MAX_INPUT_CHARS]})
+        messages.append({"role": "user", "content": text_value[:MAX_INPUT_CHARS]})
+        last_error: AIServiceError | None = None
+        request_id = uuid.uuid4().hex[:12]
+        for index, provider in enumerate(providers):
+            try:
+                content = self._chat(
+                    provider,
+                    messages,
+                    max_bytes=min(self.settings.ai_max_response_bytes, MAX_REPORT_CHARS * 2),
+                    max_tokens=self.CHAT_MAX_TOKENS,
+                    request_id=request_id,
+                )
+                warning = "AI 主通道暂不可用，已切换备用通道。" if index > 0 else None
+                return content[:MAX_REPORT_CHARS], "model", warning, provider.model
+            except AIServiceError as exc:
+                last_error = exc
+                logger.warning(
+                    "AI chat provider failed provider=%s model=%s intent=%s code=%s",
+                    provider.name,
+                    provider.model,
+                    intent,
+                    exc.code,
+                )
+            if index + 1 < len(providers):
+                continue
+            if last_error and last_error.code == "not_configured" and len(providers) == 1:
+                warning = "未配置 AI 服务，已根据账本数据生成本地回答。"
+            elif len(providers) > 1:
+                warning = "AI 主通道和备用通道均不可用，已根据账本数据生成本地回答。"
+            else:
+                warning = "AI 服务暂不可用，已根据账本数据生成本地回答。"
+            content = fallback_report(summary) if intent == "report" else fallback_answer(summary)
+            return content, "fallback", warning, None
+        raise AIServiceError("provider_unavailable")

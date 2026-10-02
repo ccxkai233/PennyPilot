@@ -7,7 +7,6 @@ The parser and analyser are intentionally proposal/report APIs.  Only
 
 from __future__ import annotations
 
-from calendar import monthrange
 from datetime import date, datetime, timedelta
 import json
 
@@ -23,17 +22,29 @@ from .accounting import (
     _transaction_payload,
     _validate_transaction_dictionaries,
 )
+from .ai_insights import (
+    PeriodSpec,
+    detect_intent,
+    first_transaction_date,
+    parse_period_text,
+    resolve_period,
+    summarize_period,
+)
 from .ai_schemas import (
     AIAnalyzeRequest,
     AIAnalyzeResponse,
+    AIChatRequest,
+    AIChatResponse,
     AIConfigRead,
     AIConfigUpdate,
     AIConfirmRequest,
     AIConfirmResponse,
+    AIPeriodInfo,
     AIReportRead,
     AIReportSummary,
     AIParseRequest,
     AIParseResponse,
+    AISummaryResponse,
 )
 from .ai_service import AIService, AIServiceError, _validated_base_url, decrypt_api_key, encrypt_api_key
 from .auth import current_user
@@ -361,21 +372,119 @@ def confirm_ai_draft(payload: AIConfirmRequest, request: Request, db: Session = 
     )
 
 
-def _period_bounds(payload: AIAnalyzeRequest) -> tuple[date, date, str]:
-    today = business_today()
-    if payload.period == "custom":
-        if payload.start_date is None or payload.end_date is None or payload.end_date < payload.start_date:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Custom analysis requires a valid date range")
-        return payload.start_date, payload.end_date, "custom"
-    anchor = payload.start_date or today
-    if payload.period == "day":
-        return anchor, payload.end_date or anchor, "day"
-    if payload.period == "week":
-        start = anchor - timedelta(days=anchor.weekday())
-        return start, start + timedelta(days=6), "week"
-    start = anchor.replace(day=1)
-    last = monthrange(anchor.year, anchor.month)[1]
-    return start, anchor.replace(day=last), "month"
+def _resolve_period_or_422(kind: str, start_date: date | None, end_date: date | None) -> PeriodSpec:
+    try:
+        return resolve_period(kind, start_date, end_date)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Custom analysis requires a valid date range") from exc
+
+
+def _period_bounds(payload: AIAnalyzeRequest, db: Session, user_id: int) -> tuple[date, date, str]:
+    spec = _resolve_period_or_422(payload.period, payload.start_date, payload.end_date)
+    start = spec.start
+    if start is None:
+        # "all" has an open lower bound; anchor the report on the first
+        # transaction so the stored history row keeps a real date range.
+        start = first_transaction_date(db, user_id) or spec.end
+    return start, spec.end, spec.kind
+
+
+def _period_info(spec: PeriodSpec, summary: dict) -> AIPeriodInfo:
+    period = summary.get("period") or spec.as_dict()
+    return AIPeriodInfo(
+        kind=spec.kind,
+        label=period.get("label") or spec.label,
+        start_date=date.fromisoformat(period["start_date"]) if period.get("start_date") else None,
+        end_date=spec.end,
+    )
+
+
+@router.get("/summary", response_model=AISummaryResponse)
+def period_summary(
+    request: Request,
+    db: Session = Depends(get_db),
+    period: str = Query(default="month", pattern="^(day|week|month|year|all|custom)$"),
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+):
+    """Aggregated income/expense figures for charts; never calls a model."""
+
+    user = _user(request, db)
+    spec = _resolve_period_or_422(period, start_date, end_date)
+    summary = summarize_period(db, user.id, spec)
+    return AISummaryResponse(period=_period_info(spec, summary), summary=summary)
+
+
+@router.post("/chat", response_model=AIChatResponse)
+def chat_about_finances(payload: AIChatRequest, request: Request, db: Session = Depends(get_db)):
+    """Answer ledger questions or write a report from aggregated data.
+
+    A bookkeeping sentence returns ``intent=bookkeeping`` without touching the
+    model so the client can continue with the parse/confirm flow.  Nothing in
+    this endpoint writes a transaction.
+    """
+
+    user = _user(request, db)
+    conversation = [item.model_dump() for item in payload.conversation]
+    has_context = any(item["role"] == "assistant" for item in conversation)
+    intent = detect_intent(payload.text, has_context)
+    if payload.period is not None and intent == "bookkeeping":
+        # An explicit period from a quick action always means a question.
+        intent = "query"
+    if intent == "bookkeeping":
+        return AIChatResponse(intent="bookkeeping")
+    if payload.period is not None:
+        spec = _resolve_period_or_422(payload.period, payload.start_date, payload.end_date)
+    else:
+        today = to_business(payload.reference_time).date() if payload.reference_time else business_today()
+        spec = parse_period_text(payload.text, today)
+        if spec is None:
+            # Look back at the user's own recent turns so “那支出呢？”
+            # keeps the period established earlier in the conversation.
+            for item in reversed(conversation):
+                if item["role"] == "user":
+                    spec = parse_period_text(item["content"], today)
+                    if spec is not None:
+                        break
+        if spec is None:
+            spec = resolve_period("month", today=today)
+    summary = summarize_period(db, user.id, spec)
+    try:
+        content, source, warning, model_name = service.chat_reply(db, user.id, payload.text, conversation, summary, intent)
+    except AIServiceError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "AI 服务暂不可用，请稍后重试。") from exc
+    content = content[:100_000]
+    report_id: int | None = None
+    if intent == "report" and payload.save_history:
+        start = spec.start or first_transaction_date(db, user.id) or spec.end
+        report = AIReport(
+            user_id=user.id,
+            period=spec.kind,
+            start_date=_date_start(start),
+            end_date=_date_start(spec.end),
+            request_summary=json.dumps(summary, ensure_ascii=False)[:200_000],
+            response_text=content,
+            source=source,
+            model=model_name if source == "model" else None,
+        )
+        db.add(report)
+        try:
+            db.commit()
+            db.refresh(report)
+            report_id = report.id
+        except SQLAlchemyError:
+            db.rollback()
+            warning = warning or "报告已生成，但历史记录暂不可用。"
+    return AIChatResponse(
+        intent=intent,
+        reply=content,
+        period=_period_info(spec, summary),
+        summary=summary,
+        report_id=report_id,
+        source=source,
+        model=model_name if source == "model" else None,
+        warning=warning,
+    )
 
 
 def _date_start(value: date) -> datetime:
@@ -387,7 +496,7 @@ def _date_start(value: date) -> datetime:
 @router.post("/analyze", response_model=AIAnalyzeResponse)
 def analyze_finances(payload: AIAnalyzeRequest, request: Request, db: Session = Depends(get_db)):
     user = _user(request, db)
-    start_date, end_date, period = _period_bounds(payload)
+    start_date, end_date, period = _period_bounds(payload, db, user.id)
     summary = service.aggregate(db, user.id, _date_start(start_date), _date_start(end_date + timedelta(days=1)))
     content, source, warning, model_name = service.analyze_text(db, user.id, summary, start_date, end_date)
     content = content[:100_000]

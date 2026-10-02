@@ -544,6 +544,20 @@ export const aiApi = {
     throw error
   }),
   report: (id) => apiFetch(`/api/ai/reports/${id}`),
+  /** Aggregated income/expense figures for a period; never calls a model. */
+  summary: (filters = { period: 'month' }) => apiFetch(`/api/ai/summary${queryString(filters)}`),
+  /**
+   * Conversational ledger question or report request.  A bookkeeping
+   * sentence comes back as ``intent: "bookkeeping"`` so the caller continues
+   * with the parse/confirm flow; the endpoint itself never writes anything.
+   */
+  chat: (data, requestOptions = {}) => apiFetch('/api/ai/chat', {
+    method: 'POST',
+    body: data,
+    retry: 1,
+    timeoutMs: 60_000,
+    ...requestOptions,
+  }),
   analyze: (data = {}, requestOptions = {}) => apiFetch('/api/ai/analyze', {
     method: 'POST',
     body: data,

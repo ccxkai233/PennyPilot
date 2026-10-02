@@ -8,6 +8,7 @@
       :confirming="confirming"
       :ai-unavailable="aiUnavailable"
       :retry-status="retryStatus"
+      :parsing-label="parsingLabel"
       :request-error="requestError"
       :draft-visible="draftVisible"
       :draft-ready="draftReady"
@@ -51,7 +52,7 @@
       <div class="compose-modebar">
         <div class="compose-mode-current"><span class="compose-mode-icon" aria-hidden="true">{{ isPartnerMode ? '↔' : isCombinedMode ? '✦' : '●' }}</span><div><strong>{{ isPartnerMode ? 'AI 已识别为未结算余额' : isCombinedMode ? 'AI 会同时整理现金与未结算余额' : 'AI 已识别为现金收支' }}</strong><span>不用选择模式，一句话里包含的变化会自动分账</span></div></div>
       </div>
-      <div class="section-heading"><div class="ai-badge">{{ isPartnerMode ? '↔' : '✦' }}</div><div><h2>说一句话，现金和往来都能记</h2><p>AI 会自动判断这是现金收支、往来余额变化，还是两者同时发生；确认前不会写入账本。</p></div></div>
+      <div class="section-heading"><div class="ai-badge">{{ isPartnerMode ? '↔' : '✦' }}</div><div><h2>说一句话，记账、查收支、要报告都可以</h2><p>AI 会自动判断这是现金收支、往来余额变化，还是两者同时发生；也可以直接问本月、本年或全部的收支情况，或让它生成收支报告。记账在确认前不会写入账本。</p></div></div>
       <div class="ai-flow" aria-label="AI 记账流程"><span class="ai-flow-step is-active"><b>1</b>描述</span><i aria-hidden="true">→</i><span class="ai-flow-step"><b>2</b>AI 整理</span><i aria-hidden="true">→</i><span class="ai-flow-step"><b>3</b>一次确认</span></div>
       <div v-if="parseSourceLabel || parseWarning" class="parse-result-meta" role="status" aria-live="polite">
         <span v-if="parseSourceLabel" class="parse-source-badge" :class="{ 'is-fallback': isFallbackParse }"><i aria-hidden="true"></i>{{ parseSourceLabel }}</span>
@@ -68,7 +69,7 @@
 
     <section v-if="conversation.length" class="conversation panel">
       <div class="panel-title"><div><h2>对话</h2><p>继续补充即可，确认前不会写入账本</p></div><button class="text-button" type="button" title="清空本轮对话和已解析草稿" @click="resetConversation">清空对话与草稿</button></div>
-      <div ref="conversationThread" class="messages" aria-live="polite"><div v-for="(message, index) in conversation" :key="`${index}-${message.content}`" class="message" :class="message.role === 'user' ? 'user-message' : 'assistant-message'"><span class="message-avatar">{{ message.role === 'user' ? '我' : '✦' }}</span><p>{{ message.content }}</p></div><div v-if="parsing" class="message assistant-message parsing-message"><span class="message-avatar">✦</span><p><span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>{{ retryStatus || '正在整理这笔记录，完成后向下核对' }} <span aria-hidden="true">↓</span></p></div></div>
+      <div ref="conversationThread" class="messages" aria-live="polite"><div v-for="(message, index) in conversation" :key="`${index}-${message.content}`" class="message" :class="[message.role === 'user' ? 'user-message' : 'assistant-message', { 'chat-message': message.kind === 'chat' }]"><span class="message-avatar">{{ message.role === 'user' ? '我' : '✦' }}</span><div class="message-bubble"><p>{{ message.content }}</p><router-link v-if="message.report_id" class="message-link" :to="{ path: '/reports', query: { report: message.report_id } }">报告已保存，在财务分析中查看 →</router-link></div></div><div v-if="parsing" class="message assistant-message parsing-message"><span class="message-avatar">✦</span><p><span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>{{ retryStatus || parsingLabel }} <span aria-hidden="true">↓</span></p></div></div>
     </section>
 
     <section v-if="draftVisible" class="confirm-card panel" :class="{ 'partner-confirm-card': isPartnerMode, 'combined-confirm-card': combinedVisible }">
@@ -118,7 +119,7 @@
           <span>快速开始</span>
           <button v-for="example in quickPrompts" :key="example.label" type="button" :disabled="parsing || confirming" @click="useQuickPrompt(example.text)">{{ example.label }}</button>
         </div>
-        <div class="prompt-foot"><span aria-live="polite">{{ parsing ? (retryStatus || 'AI 正在整理…') : conversation.length ? '继续补充本轮记录即可' : 'Enter 发送 · Shift + Enter 换行' }}</span><button class="chat-send" type="submit" :disabled="!prompt || parsing || confirming" :aria-label="parsing ? '解析中' : '发送'" :title="parsing ? '解析中' : '发送'"><span v-if="parsing" class="spinner"></span><span v-else aria-hidden="true">↑</span></button></div>
+        <div class="prompt-foot"><span aria-live="polite">{{ parsing ? (retryStatus || 'AI 正在处理…') : conversation.length ? '继续补充记录，或直接提问收支情况' : 'Enter 发送 · Shift + Enter 换行' }}</span><button class="chat-send" type="submit" :disabled="!prompt || parsing || confirming" :aria-label="parsing ? '解析中' : '发送'" :title="parsing ? '解析中' : '发送'"><span v-if="parsing" class="spinner"></span><span v-else aria-hidden="true">↑</span></button></div>
       </form>
     </section>
 
@@ -184,6 +185,7 @@ const briefComment = ref('')
 const reviewHint = '请向下滑动查看并核对本轮结果。'
 const aiUnavailable = ref(false)
 const retryStatus = ref('')
+const parsingLabel = ref('正在整理这笔记录，完成后向下核对')
 const requestError = ref(null)
 const notice = ref(null)
 const categories = ref([])
@@ -199,6 +201,9 @@ const quickPrompts = [
   { label: '收到一笔款项', text: '今天收到客户货款 3500 元，微信到账' },
   { label: '现金 + 往来', text: '支付宝扫了 1000 元给供应商王先生，供应商网站现在余额 760 元' },
   { label: '记录余额', text: '客户王先生目前未结算余额 12000 元' },
+  { label: '本月收支', text: '本月收支情况怎么样？' },
+  { label: '本年收支', text: '今年收入和支出各是多少？' },
+  { label: '生成月报', text: '生成本月收支报告' },
 ]
 
 const availableCategories = computed(() => categories.value.filter((item) => item.is_active !== false && (!item.direction || !['income', 'expense'].includes(draft.direction) || item.direction === draft.direction)))
@@ -590,14 +595,47 @@ function pushReviewBubbles(...contents) {
   })
 }
 
+async function answerLedgerQuestion(text, priorMessages, reference_time, requestOptions) {
+  const chatContext = priorMessages.filter((message) => message.kind === 'chat').slice(-12).map(({ role, content }) => ({ role, content }))
+  let payload
+  try {
+    payload = await aiApi.chat({ text, conversation: chatContext, reference_time }, requestOptions)
+  } catch (error) {
+    // An older backend without the assistant route simply parses as before.
+    if (endpointMissing(error)) return false
+    throw error
+  }
+  const intent = String(payload?.intent || 'bookkeeping').toLowerCase()
+  if (intent === 'bookkeeping' || !payload?.reply) return false
+  const userMessage = conversation.value[conversation.value.length - 1]
+  if (userMessage?.role === 'user') userMessage.kind = 'chat'
+  parseSource.value = String(payload?.source || '')
+  parseWarning.value = String(payload?.warning || '')
+  conversation.value.push({ role: 'assistant', content: String(payload.reply).trim(), kind: 'chat', report_id: payload?.report_id || null, period: payload?.period || null })
+  if (payload?.report_id) {
+    notice.value = { type: 'success', message: `${payload?.period?.label || '该周期'}收支报告已生成并保存到财务分析。` }
+    await loadHistory()
+  }
+  return true
+}
+
 async function submitPrompt() {
   const text = prompt.value.trim(); if (!text) return
   parsing.value = true; aiUnavailable.value = false; retryStatus.value = ''; requestError.value = null; confirmError.value = ''; parseSource.value = ''; parseWarning.value = ''
   conversation.value.push({ role: 'user', content: text }); prompt.value = ''
   try {
-    const priorConversation = conversation.value.slice(0, -1).slice(-12)
+    const priorMessages = conversation.value.slice(0, -1)
     const reference_time = utcNowIso()
     const requestOptions = { onRetry: retryProgress }
+    // Ask the ledger assistant first.  A question or report request is
+    // answered from aggregated data; a bookkeeping sentence comes back as
+    // ``intent: bookkeeping`` and continues with the strict parse flow below.
+    parsingLabel.value = '正在查看账本数据…'
+    const handled = await answerLedgerQuestion(text, priorMessages, reference_time, requestOptions)
+    if (handled) return
+    parsingLabel.value = '正在整理这笔记录，完成后向下核对'
+    // Earlier Q&A turns are not part of the transaction being described.
+    const priorConversation = priorMessages.filter((message) => message.kind !== 'chat').slice(-12).map(({ role, content }) => ({ role, content }))
     // Always ask for a unified proposal.  If the returned fields contain only
     // a virtual-account movement, transparently re-run the same sentence in
     // partner mode so the existing partner confirmation contract can be used.
@@ -790,7 +828,8 @@ async function confirmDraft() {
   finally { confirming.value = false }
 }
 
-function historyTitle(item) { return item.period ? `AI 分析 · ${item.period}` : item.request_text || item.text || item.prompt || 'AI 记账解析' }
+const periodLabels = { day: '今日', week: '本周', month: '本月', year: '本年', all: '全部', custom: '自定义周期' }
+function historyTitle(item) { return item.period ? `AI 分析 · ${periodLabels[item.period] || item.period}` : item.request_text || item.text || item.prompt || 'AI 记账解析' }
 function historySummary(item) { return item.response_text || item.summary || item.content || item.result?.summary || item.status || '已保存' }
 function historyStatus(item) { const status = String(item.status || '').toLowerCase(); return status === 'complete' || status === 'confirmed' ? '已确认' : status === 'error' ? '失败' : '已记录' }
 function historyStatusClass(item) { return String(item.status || '').toLowerCase() === 'error' ? 'history-error' : 'history-ok' }
@@ -811,6 +850,7 @@ onMounted(() => { draft.partner_id = selectedPartnerId.value || ''; loadReferenc
 .request-error{display:grid;gap:4px;margin-top:11px;padding:11px 12px;border:1px solid #f1d0d0;border-radius:9px;background:#fff6f6;color:#a33f46;font-size:12px;line-height:1.5}.request-error strong{font-size:12px}.request-error span{color:#8c555b}.request-error small{color:#aa7378}.request-error a{width:max-content;margin-top:2px;color:#2563eb;text-decoration:none;font-weight:600}.request-error.is-backend_unreachable,.request-error.is-timeout{border-color:#f0d9af;background:#fff9ed;color:#88651f}.request-error.is-backend_unreachable span,.request-error.is-timeout span{color:#866d3d}
 .panel{background:#fff;border-radius:13px;box-shadow:0 2px 8px #243b5a0d}.primary{border:0;border-radius:8px;background:#2563eb;color:#fff;padding:10px 17px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}.primary:hover{background:#1d4ed8}.primary:disabled{opacity:.65;cursor:wait}.secondary-link{color:#2563eb;text-decoration:none;font-size:13px;font-weight:600;padding:10px 3px}.ai-chat-header{margin-top:28px;padding:24px;border:1px solid #e1eaf7;box-shadow:0 7px 24px #23436d12}.section-heading{display:flex;align-items:center;gap:12px}.ai-badge{width:38px;height:38px;border-radius:12px;background:#edf4ff;color:#2563eb;display:grid;place-items:center;font-size:19px}.section-heading h2,.panel-title h2{margin:0;color:#34435b;font-size:17px}.section-heading p,.panel-title p{margin:6px 0 0;color:#8a97aa;font-size:12px}.prompt-form{margin-top:18px}.prompt-form textarea{width:100%;min-height:44px;max-height:130px;resize:vertical;border:1px solid #dbe2ee;border-radius:12px;padding:11px 13px;color:#44536a;background:#fbfcff;font:inherit;font-size:14px;outline:0}.prompt-form textarea:focus{border-color:#3b82f6;box-shadow:0 0 0 3px #3b82f61c}.prompt-foot{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-top:11px;color:#98a4b4;font-size:11px}.chat-composer{position:sticky;bottom:14px;z-index:20;margin-top:18px;padding:12px 16px 14px;border:1px solid #d8e6f8;box-shadow:0 10px 28px #23436d1b}.chat-composer .prompt-form{margin-top:0}.chat-send{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border:0;border-radius:50%;background:#2563eb;color:#fff;font-size:23px;line-height:1;cursor:pointer;box-shadow:0 4px 10px #2563eb38}.chat-send:disabled{opacity:.45;cursor:wait;box-shadow:none}.chat-send .spinner{margin:0;width:16px;height:16px}.fallback-hint{margin-top:11px;background:#fff8e7;color:#8a6924;padding:10px 12px;border-radius:8px;font-size:12px}.fallback-hint a{color:#2563eb;margin-left:4px;text-decoration:none}.parse-result-meta{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:12px;padding-top:12px;border-top:1px solid #edf1f6}.parse-source-badge{display:inline-flex;align-items:center;gap:6px;padding:5px 8px;border-radius:99px;background:#edf5ff;color:#2563eb;font-size:10px;font-weight:600;white-space:nowrap}.parse-source-badge i{width:6px;height:6px;border-radius:50%;background:#2563eb}.parse-source-badge.is-fallback{background:#f1f3f6;color:#64748b}.parse-source-badge.is-fallback i{background:#94a3b8}.parse-warning-text{color:#8a6924;font-size:11px;line-height:1.45}.conversation,.confirm-card,.history{margin-top:18px;overflow:hidden}.panel-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:20px 24px;border-bottom:1px solid #edf0f5}.text-button{border:0;background:transparent;color:#2563eb;font-size:12px;cursor:pointer;padding:4px}.messages{padding:18px 24px 21px;display:grid;gap:12px}.message{display:flex;gap:9px;align-items:flex-start;max-width:85%}.message-avatar{width:27px;height:27px;flex:0 0 27px;border-radius:9px;display:grid;place-items:center;font-size:11px;font-weight:600}.assistant-message .message-avatar{color:#2563eb;background:#edf4ff}.user-message{margin-left:auto;flex-direction:row-reverse;scroll-margin-top:20px}.user-message .message-avatar{color:#52617a;background:#eef2f8}.message p{margin:0;border-radius:11px;padding:10px 12px;color:#53627a;background:#f6f8fb;font-size:13px;line-height:1.6}.user-message p{color:#fff;background:#2563eb}.parsing-message p{display:inline-flex;align-items:center;gap:8px;color:#7e8da4}.typing-dots{display:inline-flex;gap:3px;align-items:center}.typing-dots i{width:5px;height:5px;border-radius:50%;background:#8ba5ce;animation:typing-dot 1.1s infinite ease-in-out}.typing-dots i:nth-child(2){animation-delay:.15s}.typing-dots i:nth-child(3){animation-delay:.3s}@keyframes typing-dot{0%,60%,100%{opacity:.35;transform:translateY(0)}30%{opacity:1;transform:translateY(-2px)}}.confirm-card{padding-bottom:22px}.draft-status{color:#8a6924;background:#fff4da;border-radius:99px;padding:5px 8px;font-size:11px}.warning{margin:16px 24px 0;border-radius:8px;padding:10px 12px;background:#fff8e7;color:#8a6924;font-size:12px}.draft-form{padding:18px 24px 0}.draft-direction{display:grid;grid-template-columns:1fr 1fr;gap:5px;padding:4px;background:#f1f5fb;border-radius:10px}.draft-direction button{border:0;border-radius:7px;padding:9px;background:transparent;color:#7c8ba1;cursor:pointer;font-size:13px}.draft-direction button.selected{background:#fff;color:#2563eb;box-shadow:0 1px 5px #263b6114;font-weight:600}.draft-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}.draft-grid label{display:block;color:#59677d;font-size:13px;margin:14px 0}.draft-grid input,.draft-grid select,.draft-grid textarea{display:block;width:100%;margin-top:6px;border:1px solid #dbe2ee;border-radius:8px;padding:10px;color:#44536a;background:#fff;font:inherit;font-size:13px;outline:0}.draft-grid input:focus,.draft-grid select,.draft-grid textarea:focus{border-color:#3b82f6}.partner-ledger-confirm{margin-top:13px;border:1px solid #dbe6f5;border-radius:9px;background:#f8fbff;padding:12px}.ledger-toggle{display:flex;align-items:center;gap:8px;color:#42536c;font-size:13px;font-weight:600}.ledger-toggle input{accent-color:#2563eb}.ledger-hint{margin:8px 0 0;color:#9a6d26;font-size:12px}.ledger-fields{display:flex;align-items:center;gap:12px;margin-top:10px}.ledger-fields label{color:#59677d;font-size:12px;flex:0 1 220px}.ledger-fields select{display:block;width:100%;margin-top:5px;border:1px solid #dbe2ee;border-radius:8px;padding:8px;color:#44536a;background:#fff;font:inherit;font-size:12px}.ledger-preview{color:#53627a;font-size:12px;white-space:nowrap}.confirm-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:8px}.outline-button{border:1px solid #d6dfec;border-radius:8px;background:#fff;color:#52617a;padding:9px 15px;cursor:pointer;font-size:13px}.form-error{margin-top:13px;color:#a83232;background:#fff0f0;border-radius:8px;padding:10px 12px;font-size:13px}.history-state{min-height:130px;display:grid;place-content:center;justify-items:center;text-align:center;color:#8b98aa;padding:20px}.history-state p{margin:7px 0;font-size:13px}.error-state{color:#ba4b53}.history-list{list-style:none;padding:0 24px;margin:0}.history-list li{display:flex;align-items:flex-start;gap:11px;padding:15px 0;border-bottom:1px solid #edf0f5}.history-list li:last-child{border-bottom:0}.history-icon{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;color:#2563eb;background:#edf4ff;font-size:14px}.history-content{min-width:0;flex:1}.history-content strong{display:block;color:#53627a;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.history-content span{display:block;color:#a0aaba;font-size:10px;margin-top:4px}.history-content p{margin:6px 0 0;color:#7d8ba0;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.history-status{border-radius:99px;padding:4px 7px;font-size:10px;white-space:nowrap}.history-ok{color:#12845e;background:#e7f8f0}.history-error{color:#c84d54;background:#fff0f0}.spinner{width:16px;height:16px;border:2px solid #ffffff66;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;display:inline-block;vertical-align:-3px;margin-right:5px}.spinner.dark{border-color:#dce7f8;border-top-color:#2563eb;margin:0 0 5px}@keyframes spin{to{transform:rotate(360deg)}}
 @media(max-width:620px){.ai-chat-header{margin-top:20px;padding:18px 16px}.prompt-foot{align-items:flex-end;flex-direction:row}.prompt-foot .chat-send{width:42px}.panel-title{padding:17px 16px}.messages,.draft-form{padding-left:16px;padding-right:16px}.message{max-width:95%}.draft-grid{grid-template-columns:1fr}.ledger-fields{align-items:stretch;flex-direction:column;gap:5px}.ledger-preview{white-space:normal}.history-list{padding:0 16px}.history-content p{white-space:normal}.secondary-link{font-size:11px}.chat-composer{bottom:8px;margin-left:0;margin-right:0;padding:10px 12px 11px}.chat-composer .prompt-form textarea{min-height:42px}.chat-composer .quick-prompts{overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none}.chat-composer .quick-prompts::-webkit-scrollbar{display:none}.chat-composer .quick-prompts button{white-space:nowrap}}
+.message-bubble{min-width:0;display:grid;gap:6px}.chat-message .message-bubble p{white-space:pre-wrap}.assistant-message.chat-message{max-width:92%}.message-link{width:max-content;max-width:100%;color:#2563eb;font-size:12px;font-weight:600;text-decoration:none}
 .reconciliation-toggle{display:flex;align-items:center;gap:8px;margin:12px 0 0;padding:10px 11px;border:1px solid #dbe6f5;border-radius:8px;background:#f8fbff;color:#596b84;font-size:12px;line-height:1.45}.reconciliation-toggle input{accent-color:#2563eb}.transfer-hint{margin:0 0 12px;padding:10px 11px;border:1px solid #dbe6f5;border-radius:8px;background:#f8fbff;color:#596b84;font-size:12px;line-height:1.5}
 @media(max-width:620px){
   .secondary-link{display:inline-flex;align-items:center;min-height:44px;padding:9px 0;font-size:12px}
