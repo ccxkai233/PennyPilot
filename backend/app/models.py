@@ -151,7 +151,7 @@ class Transaction(Base):
 
 
 class AIConfig(Base):
-    """Per-user OpenAI-compatible provider settings.
+    """Per-user AI provider settings (primary and fallback channel).
 
     The API key is stored only as authenticated ciphertext.  ``base_url`` and
     ``model`` are intentionally kept separate from ``users`` so introducing AI
@@ -172,6 +172,9 @@ class AIConfig(Base):
     fallback_base_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     fallback_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     encrypted_fallback_api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # "openai" | "anthropic" | "gemini"; NULL keeps the deployment default.
+    api_format: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    fallback_api_format: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

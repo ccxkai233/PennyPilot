@@ -105,3 +105,13 @@ def test_all_accounts_balance_revision_backfills_before_enabling_tracking():
     assert "t.status = 'normal'" in source
     assert "t.transfer_payment_method_id = pm.id" in source
     assert "track_balance = TRUE" in source
+
+
+def test_ai_api_format_revision_is_additive():
+    revision_file = REVISION_FILE.parent / "20261002_0011_ai_api_format.py"
+    source = revision_file.read_text(encoding="utf-8")
+    assert 'revision: str = "20261002_0011_ai_api_format"' in source
+    assert 'down_revision: Union[str, Sequence[str], None] = "20260819_0010_feedback"' in source
+    # Existing rows keep working: both columns are nullable and unset.
+    assert source.count("nullable=True") == 2
+    assert '"api_format"' in source and '"fallback_api_format"' in source

@@ -12,4 +12,6 @@ bcrypt==4.0.1
 # encryption.  Keys are encrypted with a Fernet key derived from the app
 # secret; they are never returned by the API.
 httpx==0.28.1
+# Official SDK for channels configured with the Anthropic API format.
+anthropic==1.11.0
 cryptography==44.0.1

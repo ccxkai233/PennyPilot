@@ -101,6 +101,8 @@ def _config_response(db: Session, user_id: int) -> AIConfigRead:
         fallback_model=getattr(row, "fallback_model", None) or service.settings.ai_fallback_model or (fallback_provider.model if fallback_provider else provider.model),
         fallback_api_key_set=bool(fallback_api_key),
         fallback_api_key_hint=service.key_hint(fallback_api_key),
+        api_format=provider.api_format,
+        fallback_api_format=service.fallback_api_format(row),
     )
 
 
@@ -157,6 +159,10 @@ def put_ai_config(payload: AIConfigUpdate, request: Request, db: Session = Depen
         row.fallback_base_url = fallback_base_url
     if fallback_model is not None:
         row.fallback_model = fallback_model.strip()
+    if payload.api_format is not None:
+        row.api_format = payload.api_format
+    if payload.fallback_api_format is not None:
+        row.fallback_api_format = payload.fallback_api_format
     if payload.clear_api_key:
         row.encrypted_api_key = None
     elif payload.api_key is not None:

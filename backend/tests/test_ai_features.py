@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import json
+from types import SimpleNamespace
+
+import anthropic
+import httpx2
 
 import pytest
 from fastapi import HTTPException
@@ -19,6 +23,8 @@ from app.ai_service import (
     AIService,
     AIServiceError,
     Provider,
+    _api_root,
+    _conversation_turns,
     _parse_time,
     decrypt_api_key,
     encrypt_api_key,
@@ -27,7 +33,7 @@ from app.ai_service import (
 )
 from app.config import Settings
 from app.db import Base
-from app.models import Category, Partner, PartnerLedgerEntry, PaymentMethod, Transaction, User
+from app.models import AIConfig, Category, Partner, PartnerLedgerEntry, PaymentMethod, Transaction, User
 from app.schemas import TransactionCreate, TransactionUpdate
 import app.ai as ai_module
 import app.accounting as accounting_module
@@ -1414,3 +1420,236 @@ def test_parse_stream_endpoint_streams_sse(monkeypatch):
     assert [frame["type"] for frame in frames] == ["provider", "status", "result"]
     assert frames[1] == {"type": "status", "code": "local_fallback"}
     assert frames[-1]["data"]["source"] == "fallback"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://gateway.example",
+        "https://gateway.example/",
+        "https://gateway.example/v1",
+        "https://gateway.example/v1/chat/completions",
+        "https://gateway.example/v1/messages",
+        "https://gateway.example/v1beta",
+    ],
+)
+def test_api_root_drops_version_and_path_suffixes(base_url):
+    assert _api_root(base_url) == "https://gateway.example"
+
+
+def test_conversation_turns_merge_roles_and_start_with_the_user():
+    system, turns = _conversation_turns(
+        [
+            {"role": "system", "content": "规则"},
+            {"role": "assistant", "content": "上一轮遗留的追问"},
+            {"role": "user", "content": "早餐12"},
+            {"role": "assistant", "content": "请向下核对"},
+            {"role": "assistant", "content": "请补充账户"},
+            {"role": "user", "content": "微信"},
+        ]
+    )
+
+    assert system == "规则"
+    assert turns == [("user", "早餐12"), ("assistant", "请向下核对\n\n请补充账户"), ("user", "微信")]
+
+
+def _format_service():
+    return AIService(Settings(_env_file=None, secret_key="s" * 64, ai_api_key="sk-test"))
+
+
+_FORMAT_MESSAGES = [
+    {"role": "system", "content": "只输出 JSON"},
+    {"role": "user", "content": "早餐微信12"},
+]
+
+
+def _gemini_chat(monkeypatch, responses, **kwargs):
+    requests = []
+
+    class FakeClient:
+        def __init__(self, **options):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def stream(self, method, url, headers, json):
+            requests.append({"url": url, "headers": headers, "body": json})
+            return responses[len(requests) - 1]
+
+    monkeypatch.setattr("app.ai_service.httpx.Client", FakeClient)
+    provider = Provider("primary", "https://gateway.example/v1", "sk-test", "gemini-3.8-flash-high", "gemini")
+    deltas = []
+    content = _format_service()._chat(provider, _FORMAT_MESSAGES, on_delta=lambda kind, text: deltas.append((kind, text)), **kwargs)
+    return content, deltas, requests
+
+
+def _gemini_line(*parts):
+    return "data: " + json.dumps({"candidates": [{"content": {"role": "model", "parts": list(parts)}}]}, ensure_ascii=False)
+
+
+def test_gemini_format_streams_thoughts_and_answer(monkeypatch):
+    response = _FakeStreamResponse(
+        [
+            _gemini_line({"text": "先拆分记录", "thought": True}),
+            _gemini_line({"text": '{"status":'}),
+            _gemini_line({"text": '"complete"}'}, {"text": "", "thoughtSignature": "sig"}),
+        ]
+    )
+
+    content, deltas, requests = _gemini_chat(monkeypatch, [response], max_tokens=AI_PARSE_MAX_TOKENS, response_format=AI_PARSE_RESPONSE_FORMAT)
+
+    assert content == '{"status":"complete"}'
+    assert deltas == [("start", ""), ("reasoning", "先拆分记录"), ("content", '{"status":'), ("content", '"complete"}')]
+    request = requests[0]
+    assert request["url"] == "https://gateway.example/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse"
+    assert request["headers"]["x-goog-api-key"] == "sk-test"
+    assert request["body"]["systemInstruction"] == {"parts": [{"text": "只输出 JSON"}]}
+    assert request["body"]["contents"] == [{"role": "user", "parts": [{"text": "早餐微信12"}]}]
+    generation = request["body"]["generationConfig"]
+    assert generation["thinkingConfig"] == {"includeThoughts": True}
+    assert generation["maxOutputTokens"] == AI_PARSE_MAX_TOKENS
+    assert generation["responseMimeType"] == "application/json"
+    # Gemini rejects null enum members; nullability stays in the type.
+    direction = generation["responseJsonSchema"]["properties"]["parsed"]["properties"]["direction"]
+    assert direction == {"type": ["string", "null"], "enum": ["income", "expense"]}
+
+
+def test_gemini_format_retries_plain_when_the_channel_rejects_the_options(monkeypatch):
+    rejected = _FakeStreamResponse([])
+    rejected.status_code = 400
+    accepted = _FakeStreamResponse([_gemini_line({"text": "好的"})])
+
+    content, deltas, requests = _gemini_chat(monkeypatch, [rejected, accepted], response_format=AI_PARSE_RESPONSE_FORMAT)
+
+    assert content == "好的"
+    assert [kind for kind, _ in deltas] == ["start", "start", "content"]
+    assert requests[1]["body"]["generationConfig"] == {"temperature": 0.2}
+
+
+class _FakeAnthropicStream:
+    def __init__(self, events, message):
+        self._events, self._message = events, message
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def __iter__(self):
+        return iter(self._events)
+
+    def get_final_message(self):
+        return self._message
+
+
+def _anthropic_chat(monkeypatch, outcomes, **kwargs):
+    captured = {"requests": []}
+
+    class FakeAnthropic:
+        def __init__(self, **options):
+            captured["options"] = options
+            self.messages = self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def stream(self, **params):
+            captured["requests"].append(params)
+            outcome = outcomes[len(captured["requests"]) - 1]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr("app.ai_service.anthropic.Anthropic", FakeAnthropic)
+    provider = Provider("primary", "https://gateway.example/v1", "sk-test", "claude-sonnet-4-6", "anthropic")
+    deltas = []
+    content = _format_service()._chat(provider, _FORMAT_MESSAGES, on_delta=lambda kind, text: deltas.append((kind, text)), **kwargs)
+    return content, deltas, captured
+
+
+def _anthropic_delta(kind, **fields):
+    return SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type=kind, **fields))
+
+
+def _anthropic_answer(text, stop_reason="end_turn"):
+    events = [
+        SimpleNamespace(type="message_start"),
+        _anthropic_delta("thinking_delta", thinking="先看金额"),
+        _anthropic_delta("text_delta", text=text),
+    ]
+    message = SimpleNamespace(stop_reason=stop_reason, content=[SimpleNamespace(type="thinking"), SimpleNamespace(type="text", text=text)])
+    return _FakeAnthropicStream(events, message)
+
+
+def test_anthropic_format_streams_thinking_and_answer(monkeypatch):
+    content, deltas, captured = _anthropic_chat(monkeypatch, [_anthropic_answer('{"status":"complete"}')], max_tokens=AI_PARSE_MAX_TOKENS, response_format=AI_PARSE_RESPONSE_FORMAT)
+
+    assert content == '{"status":"complete"}'
+    assert deltas == [("start", ""), ("reasoning", "先看金额"), ("content", '{"status":"complete"}')]
+    assert captured["options"]["base_url"] == "https://gateway.example"
+    assert captured["options"]["api_key"] == "sk-test"
+    assert captured["options"]["max_retries"] == 0
+    request = captured["requests"][0]
+    assert request["model"] == "claude-sonnet-4-6"
+    assert request["system"] == "只输出 JSON"
+    assert request["messages"] == [{"role": "user", "content": "早餐微信12"}]
+    assert request["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert request["output_config"]["effort"] == "low"
+    # Thinking shares max_tokens, so the parser's small cap is raised.
+    assert request["max_tokens"] == 16_000
+    schema = request["output_config"]["format"]["schema"]
+    assert request["output_config"]["format"]["type"] == "json_schema"
+    assert "minimum" not in schema["properties"]["parsed"]["properties"]["amount_cents"]
+    assert "temperature" not in request
+
+
+def test_anthropic_format_retries_plain_after_a_bad_request(monkeypatch):
+    response = httpx2.Response(400, request=httpx2.Request("POST", "https://gateway.example/v1/messages"))
+    rejected = anthropic.BadRequestError("unsupported option", response=response, body=None)
+
+    content, deltas, captured = _anthropic_chat(monkeypatch, [rejected, _anthropic_answer("好的")])
+
+    assert content == "好的"
+    assert [kind for kind, _ in deltas] == ["start", "start", "reasoning", "content"]
+    plain = captured["requests"][1]
+    assert "thinking" not in plain and "output_config" not in plain
+
+
+def test_anthropic_format_treats_a_refusal_as_a_provider_failure(monkeypatch):
+    with pytest.raises(AIServiceError) as error:
+        _anthropic_chat(monkeypatch, [_anthropic_answer("", stop_reason="refusal")])
+
+    assert error.value.code == "provider_refused"
+
+
+def test_ai_config_saves_and_reads_the_api_format(monkeypatch):
+    db = _db()
+    user, _, _, _ = _fixtures(db)
+    service = _format_service()
+    monkeypatch.setattr(ai_module, "service", service)
+    monkeypatch.setattr(ai_module, "_user", lambda request, session: user)
+
+    assert ai_module.get_ai_config(None, db).api_format == "openai"
+
+    saved = ai_module.put_ai_config(
+        ai_module.AIConfigUpdate(base_url="https://gateway.example", model="gemini-3.8-flash-high", api_format="gemini", fallback_model="claude-sonnet-4-6", fallback_api_format="anthropic"),
+        None,
+        db,
+    )
+
+    assert (saved.api_format, saved.fallback_api_format) == ("gemini", "anthropic")
+    row = db.query(AIConfig).one()
+    assert (row.api_format, row.fallback_api_format) == ("gemini", "anthropic")
+    primary, fallback = service.provider_chain_for_user(db, user.id)
+    assert (primary.model, primary.api_format) == ("gemini-3.8-flash-high", "gemini")
+    assert (fallback.model, fallback.api_format) == ("claude-sonnet-4-6", "anthropic")
+    with pytest.raises(ValidationError):
+        ai_module.AIConfigUpdate(api_format="cohere")

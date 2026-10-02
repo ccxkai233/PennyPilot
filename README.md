@@ -233,6 +233,16 @@ AI 配置使用 `GET/PUT (或 PATCH) /api/ai/config`，API Key 以 Fernet 密文
 `POST /api/ai/confirm-batch`（`confirm: true` + `drafts`，最多 10 笔）在同一事务中写入，任何一笔校验失败则全部不入账；
 批量确认只支持现金收支和转账，往来未结算余额仍需单笔确认。
 
+主通道和备用通道各有一个接口格式（`api_format` / `fallback_api_format`，也可用环境变量 `PENNYPILOT_AI_API_FORMAT`、`PENNYPILOT_AI_FALLBACK_API_FORMAT` 设默认值），在设置页三选一：
+
+| 格式 | 请求路径 | 说明 |
+|---|---|---|
+| `openai`（默认） | `/v1/chat/completions` | OpenAI 兼容接口；按模型名选择结构化输出和推理参数 |
+| `anthropic` | `/v1/messages` | 通过官方 `anthropic` SDK 调用；请求自适应思考（摘要可见、`effort=low`）和结构化输出，被拒绝时退回普通请求 |
+| `gemini` | `/v1beta/models/{模型}:streamGenerateContent` | 请求思考摘要和 `responseJsonSchema`（枚举中不含 `null`），被拒绝时退回普通请求 |
+
+接口地址只需填到主机（末尾带 `/v1` 也可以），后端会按格式拼接路径；三种格式都以流式方式调用，思考内容会显示在 AI 记账页的思考面板里。
+
 `POST /api/ai/parse-stream` 与 `/api/ai/parse` 的请求体相同，但以 SSE（`text/event-stream`）返回解析过程：
 `provider`（开始使用主/备用通道）、`reasoning`（模型的思考摘要增量）、`content`（草稿 JSON 增量）、`status`（复核、切换通道等），
 最后一条一定是 `result`（与 `/parse` 相同的解析结果）或 `error`。解析请求对模型使用流式输出，读取超时只限制相邻两段输出的间隔（30 秒），

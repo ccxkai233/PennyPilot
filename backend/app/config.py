@@ -14,11 +14,13 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "[::1]", "::1", "test", "testserver"}
+AIApiFormat = Literal["openai", "anthropic", "gemini"]
+
 _INSECURE_SECRET_KEYS = {
     "change-me-in-production",
     "replace-with-a-long-random-secret",
@@ -137,6 +139,16 @@ class Settings(BaseSettings):
             "AI_FALLBACK_API_KEY",
             "OPENAI_FALLBACK_API_KEY",
         ),
+    )
+    # Wire protocol spoken by each channel: OpenAI chat completions, the
+    # Anthropic Messages API, or Gemini generateContent.
+    ai_api_format: AIApiFormat = Field(
+        default="openai",
+        validation_alias=AliasChoices("PENNYPILOT_AI_API_FORMAT", "AI_API_FORMAT"),
+    )
+    ai_fallback_api_format: AIApiFormat | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PENNYPILOT_AI_FALLBACK_API_FORMAT", "AI_FALLBACK_API_FORMAT"),
     )
     ai_model: str = Field(
         default="gpt-4o-mini",
@@ -286,6 +298,14 @@ class Settings(BaseSettings):
             raise ValueError("ai_base_url must be an http(s) URL")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("ai_base_url must not contain credentials, query, or fragment")
+        return value
+
+    @field_validator("ai_api_format", "ai_fallback_api_format", mode="before")
+    @classmethod
+    def normalize_ai_api_format(cls, value: Any, info: ValidationInfo) -> Any:
+        if isinstance(value, str):
+            # Compose passes an unset variable through as an empty string.
+            return value.strip().lower() or ("openai" if info.field_name == "ai_api_format" else None)
         return value
 
     @field_validator("ai_fallback_base_url", mode="before")

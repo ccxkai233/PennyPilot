@@ -17,8 +17,9 @@ import logging
 import re
 import time
 from typing import Any, Callable, Iterable
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
+import anthropic
 import httpx
 import uuid
 from cryptography.fernet import Fernet, InvalidToken
@@ -48,6 +49,9 @@ AI_PARSE_MAX_TOKENS = 4_096
 # a long multi-record envelope is not cut off while it is still arriving.
 AI_STREAM_IDLE_TIMEOUT_SECONDS = 30.0
 AI_STREAM_TOTAL_TIMEOUT_SECONDS = 90.0
+# Anthropic counts thinking against ``max_tokens``, so the small caps used for
+# the other formats would truncate the answer.
+ANTHROPIC_MAX_TOKENS = 16_000
 DEEPSEEK_READ_TIMEOUT_SECONDS = 30.0
 DEEPSEEK_CONNECT_TIMEOUT_SECONDS = 10.0
 
@@ -218,6 +222,8 @@ class Provider:
     base_url: str
     api_key: str | None
     model: str
+    # Wire protocol of the channel: "openai", "anthropic" or "gemini".
+    api_format: str = "openai"
 
     @property
     def configured(self) -> bool:
@@ -272,6 +278,49 @@ def _validated_base_url(value: str, settings: Settings | None = None) -> str:
         ):
             raise AIServiceError("invalid_provider_url")
     return value
+
+
+def _api_root(base_url: str) -> str:
+    """Host root of a channel URL, without an OpenAI-style version or path suffix."""
+
+    root = _validated_base_url(base_url)
+    for suffix in ("/chat/completions", "/messages", "/v1", "/v1beta"):
+        root = root.removesuffix(suffix)
+    return root.rstrip("/")
+
+
+def _conversation_turns(messages: list[dict[str, str]]) -> tuple[str, list[tuple[str, str]]]:
+    """Split OpenAI-style messages into a system prompt and alternating turns.
+
+    The Anthropic and Gemini formats take the system prompt separately and
+    expect the conversation to open with the user, so consecutive messages of
+    one role are merged and leading assistant messages are dropped.
+    """
+
+    system = "\n\n".join(item["content"] for item in messages if item["role"] == "system")
+    turns: list[tuple[str, str]] = []
+    for item in messages:
+        if item["role"] == "system":
+            continue
+        role = "assistant" if item["role"] == "assistant" else "user"
+        if turns and turns[-1][0] == role:
+            turns[-1] = (role, turns[-1][1] + "\n\n" + item["content"])
+        elif turns or role == "user":
+            turns.append((role, item["content"]))
+    return system, turns
+
+
+def _schema_without(node: Any, *, keys: tuple[str, ...] = (), null_enums: bool = False) -> Any:
+    """Copy a JSON schema without the keywords a provider dialect rejects."""
+
+    if isinstance(node, dict):
+        result = {key: _schema_without(value, keys=keys, null_enums=null_enums) for key, value in node.items() if key not in keys}
+        if null_enums and isinstance(result.get("enum"), list):
+            result["enum"] = [value for value in result["enum"] if value is not None]
+        return result
+    if isinstance(node, list):
+        return [_schema_without(value, keys=keys, null_enums=null_enums) for value in node]
+    return node
 
 
 def completion_endpoint(base_url: str) -> str:
@@ -583,7 +632,11 @@ class AIService:
             base_url = _validated_base_url(base_url)
         except AIServiceError:
             base_url = self.settings.ai_base_url
-        return Provider(name="primary", base_url=base_url, api_key=(key or None), model=model.strip())
+        api_format = getattr(row, "api_format", None) or self.settings.ai_api_format
+        return Provider(name="primary", base_url=base_url, api_key=(key or None), model=model.strip(), api_format=api_format)
+
+    def fallback_api_format(self, row: AIConfig | None) -> str:
+        return getattr(row, "fallback_api_format", None) or self.settings.ai_fallback_api_format or "openai"
 
     def provider_chain_for_user(self, db: Session, user_id: int) -> list[Provider]:
         primary = self.provider_for_user(db, user_id)
@@ -606,9 +659,10 @@ class AIService:
                 base_url=fallback_base_url,
                 api_key=(fallback_api_key or None),
                 model=fallback_model.strip(),
+                api_format=self.fallback_api_format(row),
             )
         providers = [primary]
-        if fallback and (fallback.base_url, fallback.api_key, fallback.model) != (primary.base_url, primary.api_key, primary.model):
+        if fallback and (fallback.base_url, fallback.api_key, fallback.model, fallback.api_format) != (primary.base_url, primary.api_key, primary.model, primary.api_format):
             providers.append(fallback)
         return providers
 
@@ -691,6 +745,17 @@ class AIService:
     ) -> str:
         if not self.settings.ai_enabled or not provider.api_key:
             raise AIServiceError("not_configured")
+        if provider.api_format != "openai":
+            native = self._chat_anthropic if provider.api_format == "anthropic" else self._chat_gemini
+            return native(
+                provider,
+                messages,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                limit=max_bytes or self.settings.ai_max_response_bytes,
+                on_delta=on_delta or (lambda kind, text: None),
+                request_id=request_id,
+            )
         endpoint = completion_endpoint(provider.base_url)
         reasoning_controls = reasoning_controls_for_provider(provider)
         base_payload = {
@@ -830,6 +895,194 @@ class AIService:
                         round((time.monotonic() - attempt_started) * 1000),
                     )
                     raise AIServiceError("provider_unavailable")
+        raise AIServiceError("provider_http_error")
+
+    def _chat_gemini(
+        self,
+        provider: Provider,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None,
+        response_format: dict[str, Any] | None,
+        limit: int,
+        on_delta: Callable[[str, str], None],
+        request_id: str,
+    ) -> str:
+        """Call a Gemini ``streamGenerateContent`` endpoint.
+
+        Thought summaries are requested so the caller can show the model's
+        reasoning.  A channel that rejects them, or the response schema, is
+        asked again with a plain request.
+        """
+
+        system, turns = _conversation_turns(messages)
+        endpoint = f"{_api_root(provider.base_url)}/v1beta/models/{quote(provider.model, safe='')}:streamGenerateContent?alt=sse"
+        plain: dict[str, Any] = {"temperature": 0.2}
+        if max_tokens is not None:
+            plain["maxOutputTokens"] = max_tokens
+        full: dict[str, Any] = {**plain, "thinkingConfig": {"includeThoughts": True}}
+        if response_format is not None:
+            full["responseMimeType"] = "application/json"
+            # Gemini rejects ``null`` inside an enum; nullability stays in ``type``.
+            full["responseJsonSchema"] = _schema_without(response_format["json_schema"]["schema"], null_enums=True)
+        body: dict[str, Any] = {
+            "contents": [{"role": "model" if role == "assistant" else "user", "parts": [{"text": text_value}]} for role, text_value in turns],
+        }
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
+        headers = {"x-goog-api-key": provider.api_key, "Content-Type": "application/json"}
+        timeout_seconds = max(self.settings.ai_timeout_seconds, AI_STREAM_IDLE_TIMEOUT_SECONDS)
+        timeout = httpx.Timeout(timeout_seconds, connect=min(5.0, timeout_seconds))
+        for generation in (full, plain):
+            started = time.monotonic()
+            on_delta("start", "")
+            parts: list[str] = []
+            size = 0
+            try:
+                with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+                    with client.stream("POST", endpoint, headers=headers, json={**body, "generationConfig": generation}) as response:
+                        if response.status_code >= 400:
+                            logger.warning(
+                                "AI provider HTTP error id=%s provider=%s model=%s format=gemini enhanced=%s status=%d",
+                                request_id,
+                                provider.name,
+                                provider.model,
+                                generation is full,
+                                response.status_code,
+                            )
+                            if generation is full and response.status_code in {400, 422}:
+                                continue
+                            raise AIServiceError("provider_http_error")
+                        for line in response.iter_lines():
+                            if time.monotonic() - started > AI_STREAM_TOTAL_TIMEOUT_SECONDS:
+                                raise AIServiceError("provider_unavailable")
+                            if not line.startswith("data:"):
+                                continue
+                            for candidate in json.loads(line[5:]).get("candidates") or []:
+                                for part in (candidate.get("content") or {}).get("parts") or []:
+                                    text_delta = part.get("text")
+                                    if not isinstance(text_delta, str) or not text_delta:
+                                        continue
+                                    if part.get("thought"):
+                                        on_delta("reasoning", text_delta)
+                                        continue
+                                    size += len(text_delta.encode("utf-8"))
+                                    if size > limit:
+                                        raise AIServiceError("provider_response_too_large")
+                                    parts.append(text_delta)
+                                    on_delta("content", text_delta)
+            except AIServiceError:
+                raise
+            except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError, AttributeError, UnicodeError) as exc:
+                logger.warning(
+                    "AI provider transport/decoding error id=%s provider=%s model=%s format=gemini error_type=%s",
+                    request_id,
+                    provider.name,
+                    provider.model,
+                    type(exc).__name__,
+                )
+                raise AIServiceError("provider_unavailable")
+            content = "".join(parts).strip()
+            if not content:
+                raise AIServiceError("provider_invalid_response")
+            return content
+        raise AIServiceError("provider_http_error")
+
+    def _chat_anthropic(
+        self,
+        provider: Provider,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None,
+        response_format: dict[str, Any] | None,
+        limit: int,
+        on_delta: Callable[[str, str], None],
+        request_id: str,
+    ) -> str:
+        """Call the Anthropic Messages API through the official SDK.
+
+        The first request asks for a summarized view of the model's thinking
+        at low effort and, for the parser, a schema-constrained answer.
+        Models or gateways that reject those options get a plain request.
+        """
+
+        system, turns = _conversation_turns(messages)
+        plain: dict[str, Any] = {
+            "model": provider.model,
+            "max_tokens": max(max_tokens or 0, ANTHROPIC_MAX_TOKENS),
+            "messages": [{"role": role, "content": text_value} for role, text_value in turns],
+        }
+        if system:
+            plain["system"] = system
+        output_config: dict[str, Any] = {"effort": "low"}
+        if response_format is not None:
+            # Structured outputs do not accept numeric constraints.
+            output_config["format"] = {
+                "type": "json_schema",
+                "schema": _schema_without(response_format["json_schema"]["schema"], keys=("minimum",)),
+            }
+        full = {**plain, "thinking": {"type": "adaptive", "display": "summarized"}, "output_config": output_config}
+        timeout_seconds = max(self.settings.ai_timeout_seconds, AI_STREAM_IDLE_TIMEOUT_SECONDS)
+        with anthropic.Anthropic(
+            api_key=provider.api_key,
+            base_url=_api_root(provider.base_url),
+            max_retries=0,
+            timeout=anthropic.Timeout(timeout_seconds, connect=min(5.0, timeout_seconds)),
+        ) as client:
+            for params in (full, plain):
+                started = time.monotonic()
+                on_delta("start", "")
+                size = 0
+                try:
+                    with client.messages.stream(**params) as stream:
+                        for event in stream:
+                            if time.monotonic() - started > AI_STREAM_TOTAL_TIMEOUT_SECONDS:
+                                raise AIServiceError("provider_unavailable")
+                            if event.type != "content_block_delta":
+                                continue
+                            if event.delta.type == "thinking_delta":
+                                on_delta("reasoning", event.delta.thinking)
+                            elif event.delta.type == "text_delta":
+                                size += len(event.delta.text.encode("utf-8"))
+                                if size > limit:
+                                    raise AIServiceError("provider_response_too_large")
+                                on_delta("content", event.delta.text)
+                        message = stream.get_final_message()
+                except anthropic.BadRequestError:
+                    logger.warning(
+                        "AI provider rejected request id=%s provider=%s model=%s format=anthropic enhanced=%s",
+                        request_id,
+                        provider.name,
+                        provider.model,
+                        params is full,
+                    )
+                    if params is full:
+                        continue
+                    raise AIServiceError("provider_http_error")
+                except anthropic.APIStatusError as exc:
+                    logger.warning(
+                        "AI provider HTTP error id=%s provider=%s model=%s format=anthropic status=%d",
+                        request_id,
+                        provider.name,
+                        provider.model,
+                        exc.status_code,
+                    )
+                    raise AIServiceError("provider_http_error")
+                except anthropic.APIConnectionError as exc:
+                    logger.warning(
+                        "AI provider transport error id=%s provider=%s model=%s format=anthropic error_type=%s",
+                        request_id,
+                        provider.name,
+                        provider.model,
+                        type(exc).__name__,
+                    )
+                    raise AIServiceError("provider_unavailable")
+                if message.stop_reason == "refusal":
+                    raise AIServiceError("provider_refused")
+                content = "".join(block.text for block in message.content if block.type == "text").strip()
+                if not content:
+                    raise AIServiceError("provider_invalid_response")
+                return content
         raise AIServiceError("provider_http_error")
 
     @staticmethod

@@ -12,6 +12,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .config import AIApiFormat
+
 
 class AIConfigUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -22,6 +24,8 @@ class AIConfigUpdate(BaseModel):
     fallback_base_url: str | None = Field(default=None, max_length=500)
     fallback_api_key: str | None = Field(default=None, min_length=1, max_length=4096)
     fallback_model: str | None = Field(default=None, min_length=1, max_length=200)
+    api_format: AIApiFormat | None = None
+    fallback_api_format: AIApiFormat | None = None
     clear_api_key: bool = False
 
     @field_validator("base_url", "model", "fallback_base_url", "fallback_model", "fallback_api_key", mode="before")
@@ -45,6 +49,8 @@ class AIConfigRead(BaseModel):
     fallback_model: str | None = None
     fallback_api_key_set: bool = False
     fallback_api_key_hint: str | None = None
+    api_format: AIApiFormat = "openai"
+    fallback_api_format: AIApiFormat = "openai"
 
 
 class AICandidate(BaseModel):
