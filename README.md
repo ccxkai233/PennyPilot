@@ -264,7 +264,10 @@ AI 配置使用 `GET/PUT (或 PATCH) /api/ai/config`，API Key 以 Fernet 密文
 `list_transactions`（按日期、关键词、金额区间查明细，最多 100 条）、`list_accounts`（账户余额）、`list_partners`（往来未结算余额）——自行决定调用哪些，
 每次调用以 `tool`/`tool_result` 事件推送给前端显示，最多 6 轮，最后以 `result` 事件返回答案（报告会保存并带 `report_id`，
 归档周期取模型第一次汇总所用的时间段）。提示词只包含三部分：当前北京时间、工具调用方法（含账户/分类/往来单位的 id 对照表）和约束；
-页面筛选不会随问题发送，模型自行决定查询范围；“生成报告”按钮会把当前筛选写成明确的问题（如“生成 2026-10-01 至 2026-10-03 的收支报告，只看 支付宝 账户”）。
+页面筛选不会随问题发送，模型自行决定查询范围；筛选栏里的“生成报告”按钮（电脑在“重置”旁，手机在“筛选流水”旁）会把当前筛选写成明确的问题
+（如“生成 2026-10-01 至 2026-10-03 的收支报告，只看 支付宝 账户”）。报告的 `result` 事件额外带 `summary`（该周期的收支合计、笔数、
+分类占比、上期对比）和 `generated_at`；前端用 `ReportCard.vue` 把数字和模型文本排成专属的报告卡片（统计块、支出构成条、按【标题】/“•”拆分的章节），
+生成后自动弹出预览（`ReportPreview.vue`），可用 html-to-image 保存为 PNG；对话里的“查看报告卡片”可随时重新打开，历史报告按 `report_id` 读取。
 
 改账也走这个助手：`propose_update` / `propose_void` / `propose_create` 三个工具只生成方案（修改前后的对照、原因），随 `result` 事件的 `proposals` 返回，
 前端以卡片展示，用户点“确认执行”后才通过普通的流水接口（`PATCH /api/transactions/{id}`、`POST /api/transactions/{id}/void`、`POST /api/transactions`）写入，

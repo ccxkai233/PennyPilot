@@ -2170,6 +2170,9 @@ def test_ask_endpoint_streams_tool_events_and_saves_a_report(monkeypatch):
     assert result["reply"] == "【报告】支出 35.00 元。" and result["steps"][0]["name"] == "summarize_period"
     assert result["period"]["start_date"] == "2026-08-01" and result["period"]["end_date"] == "2026-08-31"
     assert result["report_id"] == db.query(AIReport).one().id
+    # The report card renders the period figures that the agent's text is based on.
+    assert result["summary"]["expense_cents"] == 4500 and result["summary"]["period"]["start_date"] == "2026-08-01"
+    assert result["generated_at"]
 
 
 def test_api_errors_reach_the_client_in_chinese():

@@ -85,11 +85,11 @@ let bodyWasLocked = false
 const primaryItems = [
   { to: '/dashboard', label: '概览', icon: '⌂' },
   { to: '/ai', label: 'AI 记账', icon: '✦' },
+  { to: '/transactions', label: '收支记录', icon: '↕' },
   { to: '/partners', label: '往来', icon: '♧' },
-  { to: '/settlements', label: '日结', icon: '▣' },
 ]
 const moreItems = [
-  { to: '/transactions', label: '手动流水', icon: '↕', query: { mode: 'manual', from: 'ai' } },
+  { to: '/settlements', label: '日结', icon: '▣' },
   { to: '/reports', label: '财务分析', icon: '▥' },
   { to: '/feedback', label: '意见反馈', icon: '✉' },
   { to: '/settings', label: '设置', icon: '⚙' },

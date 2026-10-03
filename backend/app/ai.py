@@ -809,6 +809,9 @@ def ask_ledger(payload: AIChatRequest, request: Request, db: Session = Depends(g
                 "proposals": result.proposals,
                 "conversation_id": thread_id,
                 "message_id": message_id,
+                # Figures for the report card (totals, categories, comparison).
+                "summary": summary if intent == "report" else None,
+                "generated_at": now_utc().isoformat(),
             }
 
     return StreamingResponse(
