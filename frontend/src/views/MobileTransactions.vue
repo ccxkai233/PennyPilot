@@ -180,6 +180,7 @@ function autoGrow(element) {
 }
 const askThread = ref(null)
 watch(() => props.ask.messages.length + (props.ask.loading ? 1 : 0), () => {
+  if (!props.ask.follow) return
   nextTick(() => {
     const items = askThread.value?.querySelectorAll('.mobile-ask-message')
     items?.[items.length - 1]?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })

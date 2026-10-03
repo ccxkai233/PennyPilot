@@ -77,7 +77,7 @@ async function logout() {
 
 <style scoped>
 .app-shell { display: flex; width: 100%; min-height: 100vh; min-height: 100dvh; background: #f5f7fb; overflow-x: clip; }
-.sidebar { width: 235px; flex: 0 0 235px; min-height: 100vh; min-height: 100dvh; background: #111b2d; color: #b7c4d9; padding: 24px 15px; display: flex; flex-direction: column; z-index: 20; }
+.sidebar { position: sticky; top: 0; align-self: flex-start; width: 235px; flex: 0 0 235px; height: 100vh; height: 100dvh; overflow-y: auto; background: #111b2d; color: #b7c4d9; padding: 24px 15px; display: flex; flex-direction: column; z-index: 20; }
 .sidebar { padding: max(24px, env(safe-area-inset-top)) max(15px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(15px, env(safe-area-inset-left)); }
 .side-brand { display: flex; align-items: center; gap: 10px; color: #fff; font-size: 18px; padding: 0 10px 35px; }
 .brand-mark { width: 34px; height: 34px; border-radius: 9px; background: #3b82f6; color: #fff; display: grid; place-items: center; font-size: 19px; }

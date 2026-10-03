@@ -186,7 +186,7 @@ const subtitle = computed(() => `共 ${transactions.value.length} 笔记录`)
 
 // Questions about the list are answered from aggregated figures within the
 // current filters; the AI page only does bookkeeping.
-const ask = reactive({ text: '', loading: false, reportLoading: false, error: '', messages: [], steps: [], stage: '', conversationId: null, history: [], historyOpen: false, historyLoading: false })
+const ask = reactive({ text: '', loading: false, reportLoading: false, follow: false, error: '', messages: [], steps: [], stage: '', conversationId: null, history: [], historyOpen: false, historyLoading: false })
 // The report card: figures + the model's text, shown in a preview that can be
 // saved as an image.  Older reports are fetched by id when reopened.
 const reportPreview = reactive({ open: false, loading: false, report: null })
@@ -224,6 +224,7 @@ async function loadConversation(id) {
   if (!id) return
   try {
     const payload = await aiApi.conversation(id)
+    ask.follow = false // restoring a thread must not scroll the page
     ask.conversationId = payload.id
     ask.messages = (payload.messages || []).map((item) => ({ id: item.id, role: item.role, content: item.content, steps: item.steps || [], proposals: item.proposals || [], period: item.period || '', warning: item.warning || '', report_id: item.report_id || null }))
     localStorage.setItem(CONVERSATION_KEY, String(payload.id))
@@ -296,7 +297,7 @@ const reportQuestion = computed(() => {
 async function askLedger(text, intent = 'query') {
   const question = String(text || '').trim()
   if (!question || ask.loading) return
-  ask.error = ''; ask.loading = true; ask.reportLoading = intent === 'report'; ask.steps = []; ask.stage = '正在连接 AI…'
+  ask.error = ''; ask.loading = true; ask.follow = true; ask.reportLoading = intent === 'report'; ask.steps = []; ask.stage = '正在连接 AI…'
   ask.messages.push({ role: 'user', content: question })
   if (intent === 'query') { ask.text = ''; nextTick(() => ['ask-ledger-input', 'mobile-ask-input'].forEach((id) => autoGrow(document.getElementById(id)))) }
   try {
@@ -322,7 +323,10 @@ function autoGrow(element) {
   element.style.height = `${Math.min(element.scrollHeight, 132)}px`
 }
 const askThread = ref(null)
+// Follow the thread only while the user is asking; a thread restored on page
+// load stays where it is so the page does not jump down by itself.
 watch(() => ask.messages.length + (ask.loading ? 1 : 0), () => {
+  if (!ask.follow) return
   nextTick(() => {
     const items = askThread.value?.querySelectorAll('.ask-message')
     items?.[items.length - 1]?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
