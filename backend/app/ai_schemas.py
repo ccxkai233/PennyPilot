@@ -99,9 +99,15 @@ class AIParsedTransaction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     occurred_at: datetime | None = None
-    kind: Literal["cashflow", "transfer"] = "cashflow"
+    # ``balance_check`` reports an account's real balance; confirmation turns
+    # the difference to the stored balance into one income/expense entry.
+    kind: Literal["cashflow", "transfer", "balance_check"] = "cashflow"
     direction: Literal["income", "expense"] | None = None
     amount_cents: int | None = Field(default=None, gt=0)
+    account_balance_cents: int | None = Field(default=None, ge=0)
+    # Filled in by the parser for the confirmation card; never trusted on confirm.
+    account_balance_expected_cents: int | None = None
+    account_balance_delta_cents: int | None = None
     category_id: int | None = Field(default=None, gt=0)
     category_name: str | None = Field(default=None, max_length=100)
     payment_method_id: int | None = Field(default=None, gt=0)
@@ -146,6 +152,15 @@ class AIParsedTransaction(BaseModel):
             self.category_name = None
             self.partner_ledger_type = None
             self.partner_ledger_amount_cents = None
+        if self.kind == "balance_check":
+            self.direction = None
+            self.amount_cents = None
+            self.transfer_payment_method_id = None
+            self.transfer_payment_method_name = None
+            self.partner_ledger_type = None
+            self.partner_ledger_amount_cents = None
+            self.partner_balance_after_cents = None
+            self.partner_balance_kind = None
         if self.partner_ledger_amount_cents == 0 and self.partner_ledger_type != "balance_check":
             raise ValueError("partner_ledger_amount_cents must be non-zero unless this is a balance check")
         if self.partner_ledger_amount_cents is not None and self.partner_ledger_type not in {"limit_adjust", "balance_check"} and self.partner_ledger_amount_cents < 0:
@@ -350,6 +365,16 @@ class AIChatRequest(BaseModel):
     start_date: date | None = None
     end_date: date | None = None
     save_history: bool = True
+    # A client that only ever asks questions (the transactions page) states
+    # the intent itself instead of relying on sentence classification.
+    intent: Literal["query", "report"] | None = None
+    # Continue a stored conversation; omitted on the first question of a thread.
+    conversation_id: int | None = Field(default=None, gt=0)
+    # Narrow the figures to the list filters the user is looking at.
+    payment_method_id: int | None = Field(default=None, gt=0)
+    category_id: int | None = Field(default=None, gt=0)
+    partner_id: int | None = Field(default=None, gt=0)
+    direction: Literal["income", "expense"] | None = None
 
     @field_validator("text", mode="before")
     @classmethod
@@ -359,12 +384,38 @@ class AIChatRequest(BaseModel):
         return value
 
 
+class AIConversationSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    title: str
+    message_count: int
+    updated_at: datetime
+
+
+class AIConversationRead(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    title: str
+    updated_at: datetime
+    messages: list[dict[str, Any]]
+
+
+class AIProposalStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["applied", "ignored", "failed"]
+    detail: str | None = Field(default=None, max_length=300)
+
+
 class AIChatResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     intent: Literal["bookkeeping", "query", "report"]
     reply: str | None = Field(default=None, max_length=100_000)
     period: AIPeriodInfo | None = None
+    scope: dict[str, str] = Field(default_factory=dict)
     summary: dict | None = None
     report_id: int | None = None
     source: Literal["model", "fallback"] | None = None

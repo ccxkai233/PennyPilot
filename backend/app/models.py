@@ -204,6 +204,38 @@ class AIReport(Base):
     )
 
 
+class AIConversation(Base):
+    """A thread of ledger questions and answers on the transactions page."""
+
+    __tablename__ = "ai_conversations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class AIConversationMessage(Base):
+    """One turn of a conversation, with the tool steps and change proposals it produced."""
+
+    __tablename__ = "ai_conversation_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("ai_conversations.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # [{name, summary, result}] tool calls shown under the answer
+    steps: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # [{type, status, before, after, ...}] change proposals awaiting confirmation
+    proposals: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    report_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    period_label: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    warning: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class DailySnapshot(Base):
     """Immutable (outside an explicit recalculation) daily settlement.
 

@@ -52,6 +52,9 @@ AI_STREAM_TOTAL_TIMEOUT_SECONDS = 90.0
 # Anthropic counts thinking against ``max_tokens``, so the small caps used for
 # the other formats would truncate the answer.
 ANTHROPIC_MAX_TOKENS = 16_000
+# Ledger questions and reports run at full reasoning depth; reasoning tokens
+# count against the cap on several families, so leave plenty of room.
+ANALYSIS_MAX_TOKENS = 16_000
 DEEPSEEK_READ_TIMEOUT_SECONDS = 30.0
 DEEPSEEK_CONNECT_TIMEOUT_SECONDS = 10.0
 
@@ -69,9 +72,10 @@ logger = logging.getLogger(__name__)
 # matching candidates, so those model hints never become bookkeeping facts.
 _AI_PARSE_RECORD_PROPERTIES: dict[str, Any] = {
     "occurred_at": {"type": ["string", "null"]},
-    "kind": {"type": "string", "enum": ["cashflow", "transfer"]},
+    "kind": {"type": "string", "enum": ["cashflow", "transfer", "balance_check"]},
     "direction": {"type": ["string", "null"], "enum": ["income", "expense", None]},
     "amount_cents": {"type": ["integer", "null"], "minimum": 1},
+    "account_balance_cents": {"type": ["integer", "null"], "minimum": 0},
     "category_id": {"type": ["integer", "null"], "minimum": 1},
     "category_name": {"type": ["string", "null"]},
     "payment_method_id": {"type": ["integer", "null"], "minimum": 1},
@@ -91,7 +95,7 @@ _AI_PARSE_RECORD_PROPERTIES: dict[str, Any] = {
 # balance, so they use a compact shape: output length drives the provider's
 # response time, and a long run of purchases must still fit the timeout.
 _AI_PARSE_EXTRA_RECORD_KEYS = [
-    "occurred_at", "kind", "direction", "amount_cents", "category_name",
+    "occurred_at", "kind", "direction", "amount_cents", "account_balance_cents", "category_name",
     "payment_method_name", "transfer_payment_method_name", "partner_name", "notes",
 ]
 
@@ -126,7 +130,7 @@ AI_PARSE_JSON_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {
                 "type": "string",
-                "enum": ["direction", "amount_cents", "category", "payment_method", "transfer_payment_method", "partner"],
+                "enum": ["direction", "amount_cents", "account_balance_cents", "category", "payment_method", "transfer_payment_method", "partner"],
             },
         },
         "follow_up_question": {"type": ["string", "null"]},
@@ -179,24 +183,27 @@ def response_format_for_provider(
     return response_format
 
 
-def reasoning_controls_for_provider(provider: "Provider") -> dict[str, Any]:
-    """Prefer the lowest-latency non-reasoning mode when it is supported.
+def reasoning_controls_for_provider(provider: "Provider", effort: str = "low") -> dict[str, Any]:
+    """Reasoning parameters for a model family at the requested effort.
 
-    DeepSeek and GPT-5 expose different OpenAI-compatible request fields.
-    Keep the decision tied to the model name so primary and fallback channels
-    behave the same regardless of which endpoint the user assigns to them.
-    Unknown/non-reasoning model families keep their provider defaults.
+    ``low`` is the lowest-latency mode the family supports and is used by the
+    parser; ``high`` asks for the deepest reasoning and is used for ledger
+    questions and reports.  DeepSeek and GPT-5 expose different
+    OpenAI-compatible request fields.  Keep the decision tied to the model
+    name so primary and fallback channels behave the same regardless of which
+    endpoint the user assigns to them.  Unknown families keep their defaults.
     """
 
     model = (provider.model or "").strip().lower()
+    deep = effort == "high"
     if _is_deepseek_model(model):
-        return {"thinking": {"type": "disabled"}}
+        return {"thinking": {"type": "enabled" if deep else "disabled"}}
     if re.match(r"^gpt-5(?:[.\-]|$)", model):
-        return {"reasoning_effort": "none"}
+        return {"reasoning_effort": "high" if deep else "none"}
     if re.match(r"^gpt-6(?:[.\-]|$)", model):
         # GPT-6 cannot switch reasoning off; "low" is its fastest level and
         # makes the gateway stream the reasoning summary.
-        return {"reasoning_effort": "low"}
+        return {"reasoning_effort": "high" if deep else "low"}
     return {}
 
 
@@ -471,6 +478,9 @@ _MISSING_FIELD_ALIASES = {
     "direction": "direction",
     "amount": "amount_cents",
     "amount_cents": "amount_cents",
+    "account_balance_cents": "account_balance_cents",
+    "account_balance": "account_balance_cents",
+    "balance": "account_balance_cents",
     "category": "category",
     "category_id": "category",
     "category_name": "category",
@@ -524,6 +534,11 @@ def _required_missing_fields(parsed: dict[str, Any], mode: str = "cash") -> list
     if mode == "partner":
         if parsed.get("amount_cents") is None and parsed.get("partner_ledger_amount_cents") is None:
             missing.append("amount_cents")
+    elif kind == "balance_check":
+        if parsed.get("payment_method_id") is None:
+            missing.append("payment_method")
+        if parsed.get("account_balance_cents") is None:
+            missing.append("account_balance_cents")
     else:
         if parsed.get("direction") not in {"income", "expense"}:
             missing.append("direction")
@@ -570,6 +585,8 @@ def _field_status(
     missing_set = set(missing)
     inferred_set = set(inferred)
     fields = ["occurred_at", "direction", "amount_cents", "category", "payment_method", "partner"]
+    if parsed.get("kind") == "balance_check":
+        fields = ["occurred_at", "payment_method", "account_balance_cents"]
     if (
         parsed.get("kind") == "transfer"
         or "transfer_payment_method" in missing_set
@@ -608,6 +625,8 @@ def _default_brief_comment(parsed: AIParsedTransaction, mode: str) -> str:
         return "这次只更新往来账户的当前未结算余额，不会影响现金收支。"
     if parsed.kind == "transfer":
         return "这笔记录属于账户间转账或还款，只调整账户余额，不计入日常收入或支出。"
+    if parsed.kind == "balance_check":
+        return "这是一次余额校准，确认后会按与系统余额的差额生成一笔收入或支出流水。"
     if parsed.direction == "income":
         return "这笔收入会增加所选资金账户余额，确认前请核对金额、分类和到账账户。"
     if parsed.direction == "expense":
@@ -757,6 +776,7 @@ class AIService:
         response_format: dict[str, Any] | None = None,
         request_id: str = "-",
         on_delta: Callable[[str, str], None] | None = None,
+        effort: str = "low",
     ) -> str:
         if not self.settings.ai_enabled or not provider.api_key:
             raise AIServiceError("not_configured")
@@ -770,9 +790,10 @@ class AIService:
                 limit=max_bytes or self.settings.ai_max_response_bytes,
                 on_delta=on_delta or (lambda kind, text: None),
                 request_id=request_id,
+                effort=effort,
             )
         endpoint = completion_endpoint(provider.base_url)
-        reasoning_controls = reasoning_controls_for_provider(provider)
+        reasoning_controls = reasoning_controls_for_provider(provider, effort)
         base_payload = {
             "model": provider.model,
             "messages": messages,
@@ -922,6 +943,7 @@ class AIService:
         limit: int,
         on_delta: Callable[[str, str], None],
         request_id: str,
+        effort: str = "low",
     ) -> str:
         """Call a Gemini ``streamGenerateContent`` endpoint.
 
@@ -935,7 +957,8 @@ class AIService:
         plain: dict[str, Any] = {"temperature": 0.2}
         if max_tokens is not None:
             plain["maxOutputTokens"] = max_tokens
-        full: dict[str, Any] = {**plain, "thinkingConfig": {"includeThoughts": True}}
+        # The parser keeps the model's own thinking level; analysis asks for the deepest.
+        full: dict[str, Any] = {**plain, "thinkingConfig": {"includeThoughts": True, **({"thinkingLevel": "high"} if effort == "high" else {})}}
         if response_format is not None:
             full["responseMimeType"] = "application/json"
             # Gemini rejects ``null`` inside an enum; nullability stays in ``type``.
@@ -1013,6 +1036,7 @@ class AIService:
         limit: int,
         on_delta: Callable[[str, str], None],
         request_id: str,
+        effort: str = "low",
     ) -> str:
         """Call the Anthropic Messages API through the official SDK.
 
@@ -1029,7 +1053,7 @@ class AIService:
         }
         if system:
             plain["system"] = system
-        output_config: dict[str, Any] = {"effort": "low"}
+        output_config: dict[str, Any] = {"effort": "max" if effort == "high" else "low"}
         if response_format is not None:
             # Structured outputs do not accept numeric constraints.
             output_config["format"] = {
@@ -1278,6 +1302,7 @@ class AIService:
             "direction",
             "amount_cents",
             "amount",
+            "account_balance_cents",
             "category_id",
             "category_name",
             "payment_method_id",
@@ -1307,7 +1332,7 @@ class AIService:
 
     @staticmethod
     def _has_cash_fields(value: dict[str, Any]) -> bool:
-        return value.get("kind") == "transfer" or any(
+        return value.get("kind") in {"transfer", "balance_check"} or any(
             value.get(key) is not None
             for key in ("direction", "amount_cents", "payment_method_id", "payment_method_name")
         )
@@ -1388,12 +1413,19 @@ class AIService:
             inferred.add("occurred_at")
         if value.get("amount_cents") is not None:
             value["amount_cents"] = _amount_to_cents(value["amount_cents"], cents=True)
+        if value.get("account_balance_cents") is not None:
+            value["account_balance_cents"] = _amount_to_cents(value["account_balance_cents"], cents=True)
         direction = value.get("direction")
         if direction not in {"income", "expense"}:
             direction = None
             value["direction"] = None
-        kind = value.get("kind") if value.get("kind") in {"cashflow", "transfer"} else "cashflow"
+        kind = value.get("kind") if value.get("kind") in {"cashflow", "transfer", "balance_check"} else "cashflow"
         value["kind"] = kind
+        if kind == "balance_check":
+            value["direction"] = None
+            value["amount_cents"] = None
+            value["category_id"] = None
+            value["category_name"] = None
         if kind == "transfer":
             value["direction"] = "expense"
             value["category_id"] = None
@@ -1411,7 +1443,7 @@ class AIService:
                 ),
                 None,
             ) if value.get(id_key) else None
-            if field == "category" and kind == "transfer":
+            if field == "category" and kind in {"transfer", "balance_check"}:
                 continue
             if candidate is None:
                 candidate = self._match(value.get(name_key), options, direction if field == "category" else None)
@@ -1451,6 +1483,13 @@ class AIService:
         if value.get("payment_method_id") and value.get("transfer_payment_method_id") and value["payment_method_id"] == value["transfer_payment_method_id"]:
             value["transfer_payment_method_id"] = None
             value["transfer_payment_method_name"] = None
+        if kind == "balance_check" and value.get("payment_method_id") is not None and value.get("account_balance_cents") is not None:
+            # The card shows the stored balance and the resulting entry; the
+            # confirmation recomputes both against the locked account row.
+            account = next((item for item in methods if item.id == value["payment_method_id"]), None)
+            expected = int(account.current_balance_cents or 0) if account else 0
+            value["account_balance_expected_cents"] = expected
+            value["account_balance_delta_cents"] = int(value["account_balance_cents"]) - expected
         try:
             parsed = AIParsedTransaction.model_validate(value)
         except ValidationError:
@@ -1463,7 +1502,7 @@ class AIService:
         status = "complete" if not missing else "need_more_info"
         follow = None
         if missing:
-            labels = {"direction": "收支方向", "amount_cents": "金额", "category": "分类", "payment_method": "来源账户", "transfer_payment_method": "转入/还款账户", "partner": "往来单位"}
+            labels = {"direction": "收支方向", "amount_cents": "金额", "account_balance_cents": "账户当前余额", "category": "分类", "payment_method": "来源账户", "transfer_payment_method": "转入/还款账户", "partner": "往来单位"}
             follow = "请补充：" + "、".join(labels.get(x, x) for x in missing) + "。"
         payload = parsed.model_dump()
         payload["field_status"] = _field_status(payload, missing, inferred)
@@ -1838,7 +1877,7 @@ class AIService:
             "所有键名和字符串值必须使用双引号。"
             "不要 Markdown、代码围栏、解释或 envelope 之外的键。JSON 结构必须是："
             '{"status":"need_more_info","parsed":{"occurred_at":null,"kind":"cashflow","direction":null,'
-            '"amount_cents":null,"category_id":null,"category_name":null,'
+            '"amount_cents":null,"account_balance_cents":null,"category_id":null,"category_name":null,'
             '"payment_method_id":null,"payment_method_name":null,'
             '"transfer_payment_method_id":null,"transfer_payment_method_name":null,'
             '"partner_id":null,'
@@ -1849,7 +1888,7 @@ class AIService:
             '"payment_method":"missing","transfer_payment_method":"missing","partner":"missing"}},'
             '"missing_fields":["direction","amount_cents","payment_method"],"follow_up_question":"请补充信息",'
             '"brief_comment":"一句话简评","extra_records":[]}。'
-            "status 仅允许 complete 或 need_more_info。kind 仅允许 cashflow 或 transfer；direction 仅允许 income 或 expense；"
+            "status 仅允许 complete 或 need_more_info。kind 仅允许 cashflow、transfer 或 balance_check；direction 仅允许 income 或 expense；"
             "amount_cents 必须是整数分。field_status 的键仅使用 occurred_at、direction、"
             "amount_cents、category、payment_method、transfer_payment_method、partner，值仅允许 explicit、inferred、missing，"
             "禁止 confirmed、known、present 等其他值。missing_fields 中仅允许 direction、"
@@ -1879,7 +1918,7 @@ class AIService:
             + "payment_methods 的 kind 是账户性质：cash=现金账户，liability=信用卡/花呗/白条/贷款等负债账户，investment=投资账户。京东白条、花呗、信用卡、借呗等属于 payment_method，不是 partner。"
             + "partner_balance_after_cents 表示往来当前未结算余额，客户和供应商都只记录这一项。partner_ledger_type 是流水操作类型，不是客户/供应商类型；只要记录当前未结算余额，就必须输出 partner_ledger_type=balance_check，绝不能输出 supplier 或 customer。partner_balance_kind 也不是客户/供应商类型：供应商固定使用 prepaid_balance，客户固定使用 credit_used；绝不能输出 balance_check、supplier 或 customer。"
             + "常用省略表达也必须按完整业务语义解析：如果句首名称能匹配 partners 中的客户，后面紧接支付方式和‘转账/付款/打款+金额’，例如‘客户A支付宝转账一万’，表示该客户通过该支付方式向用户付款；应输出现金收入、对应支付账户、金额（中文数词和万/千等单位要换算成整数分），分类优先匹配‘其他收入’，并关联该客户。若已匹配客户或供应商，原话中的‘已结清’‘结清了’‘已清账’表示该往来账户当前未结算余额为 0；必须同时输出 partner_ledger_type=balance_check、partner_ledger_amount_cents=0、partner_balance_after_cents=0，并按账户类型填写 partner_balance_kind。若同一句还包含现金收付款，必须保留现金与往来两组字段，不能因余额为 0 就省略往来字段。"
-            + "候选项中的 payment_method.current_balance_cents 是系统当前账户余额（仅作核对，不要把它当成用户本次金额），每个资金账户都会自动维护余额，liability 账户的余额表示当前欠款。partners 中 unsettled_balance_cents 是当前未结算余额，优先用 partner_id 精确匹配同名账户。若用户只说‘支出/消费’且没有更具体用途，优先选择候选分类‘其他支出’；若用户说‘账户/银行卡内有X元’或‘余额有X元’并要求‘记一下/入账’，且没有支出、支付、消费语义，则按现金流入处理，分类优先选择‘其他收入’。例如‘中国工商银行内有103.01元，记一下’应输出 direction=income、amount_cents=10301、payment_method_name=中国工商银行、category_name=其他收入。"
+            + "候选项中的 payment_method.current_balance_cents 是系统当前账户余额（仅作核对，不要把它当成用户本次金额），每个资金账户都会自动维护余额，liability 账户的余额表示当前欠款。partners 中 unsettled_balance_cents 是当前未结算余额，优先用 partner_id 精确匹配同名账户。若用户只说‘支出/消费’且没有更具体用途，优先选择候选分类‘其他支出’；余额校准规则：用户报告某个资金账户此刻的余额而没有描述收支动作，例如‘支付宝现在余额2345.67’‘校准一下微信余额，实际有103.01元’‘工商银行卡里有5000元’‘信用卡目前欠款3000’，输出 kind=balance_check，payment_method 为该账户，account_balance_cents 为用户报告的余额（负债账户填当前欠款），direction、amount_cents、category 都为 null；系统会用它和当前余额的差额生成校准流水，不要自己计算差额，也不要把余额当成一笔收入或支出。balance_check 只用于 payment_methods 里的资金账户；客户、供应商等往来单位的未结算余额不是 balance_check，仍按往来规则输出 kind=cashflow、partner_ledger_type=balance_check 和 partner_balance_after_cents，即使该往来单位不在候选项里也要把名字写进 partner_name。"
             + json.dumps(options, ensure_ascii=False)
         )
         messages = [{"role": "system", "content": system}]
@@ -2149,7 +2188,7 @@ class AIService:
         last_error: AIServiceError | None = None
         for index, provider in enumerate(providers):
             try:
-                content = self._chat(provider, [{"role": "system", "content": "只分析用户提供的数据。"}, {"role": "user", "content": prompt}], max_bytes=min(self.settings.ai_max_response_bytes, MAX_REPORT_CHARS * 2))
+                content = self._chat(provider, [{"role": "system", "content": "只分析用户提供的数据。"}, {"role": "user", "content": prompt}], max_bytes=min(self.settings.ai_max_response_bytes, MAX_REPORT_CHARS * 2), max_tokens=ANALYSIS_MAX_TOKENS, effort="high")
                 warning = "AI 主通道暂不可用，已切换备用通道。" if index > 0 else None
                 return content, "model", warning, provider.model
             except AIServiceError as exc:
@@ -2159,7 +2198,6 @@ class AIService:
             warning = "AI 主通道和备用通道均不可用，已生成本地分析。" if len(providers) > 1 else ("未配置 AI 服务，已生成本地分析。" if last_error and last_error.code == "not_configured" else "AI 服务暂不可用，已生成本地分析。")
             return self.fallback_report(summary, start, end), "fallback", warning, None
 
-    CHAT_MAX_TOKENS = 2_048
 
     def chat_reply(
         self,
@@ -2188,7 +2226,8 @@ class AIService:
             "你是 PennyPilot 记账应用的财务助手，只根据下面提供的聚合数据回答用户关于账本的问题。"
             f"当前北京日期是 {today}。数据周期：{label}"
             f"（{period.get('start_date') or '最早记录'} 至 {period.get('end_date')}）。"
-            "所有金额字段以“分”为单位（*_cents），回答时必须换算成元并保留两位小数，例如 123456 分 = 1,234.56 元。"
+            + ("数据范围已限定为：" + "，".join(f"{key}={value}" for key, value in summary["scope"].items()) + "；回答和报告都要说明这个范围。" if summary.get("scope") else "")
+            + "所有金额字段以“分”为单位（*_cents），回答时必须换算成元并保留两位小数，例如 123456 分 = 1,234.56 元。"
             "share 是占比（0-1 之间的小数），请以百分比表达。previous/change 表示与上一周期的对比；"
             "days_elapsed 小于 days_total 说明本周期尚未结束，做对比时要说明这一点。"
             "不要编造数据中没有的数字或交易；数据为空时如实说明没有记录。"
@@ -2219,8 +2258,9 @@ class AIService:
                     provider,
                     messages,
                     max_bytes=min(self.settings.ai_max_response_bytes, MAX_REPORT_CHARS * 2),
-                    max_tokens=self.CHAT_MAX_TOKENS,
+                    max_tokens=ANALYSIS_MAX_TOKENS,
                     request_id=request_id,
+                    effort="high",
                 )
                 warning = "AI 主通道暂不可用，已切换备用通道。" if index > 0 else None
                 return content[:MAX_REPORT_CHARS], "model", warning, provider.model

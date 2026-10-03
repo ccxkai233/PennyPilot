@@ -2,7 +2,9 @@ import logging
 import sys
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -23,6 +25,7 @@ from .auth import (
 )
 from .config import get_settings
 from .db import get_db
+from .errors import localize_detail, localize_validation_errors
 from .models import Category, PaymentMethod, SessionToken, User
 from .schemas import LoginRequest, UserCreate, UserRead
 
@@ -89,6 +92,19 @@ async def security_headers(request: Request, call_next):
             "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
         )
     return response
+
+@app.exception_handler(HTTPException)
+async def localized_http_exception(request: Request, exc: HTTPException):
+    """Return error details in Chinese; headers such as Retry-After are kept."""
+
+    return JSONResponse({"detail": localize_detail(exc.detail)}, status_code=exc.status_code, headers=getattr(exc, "headers", None))
+
+
+@app.exception_handler(RequestValidationError)
+async def localized_validation_error(request: Request, exc: RequestValidationError):
+    return JSONResponse({"detail": localize_validation_errors(exc.errors())}, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+
 app.include_router(accounting_router)
 app.include_router(partners_router)
 app.include_router(ai_router)

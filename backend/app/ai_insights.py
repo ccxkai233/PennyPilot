@@ -19,7 +19,8 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .models import Category, Transaction
+from .models import Category, PaymentMethod, Transaction
+from .partner_models import Partner
 from .timezone import business_day_start_utc, business_today, to_business
 
 
@@ -360,7 +361,12 @@ def _bounds(spec: PeriodSpec) -> tuple[datetime | None, datetime]:
     return start, end
 
 
-def _base_filter(user_id: int, start: datetime | None, end: datetime):
+# Optional narrowing of a summary to one account, category, partner or
+# direction; the keys mirror the transaction list filters.
+SCOPE_KEYS = ("payment_method_id", "category_id", "partner_id", "direction")
+
+
+def _base_filter(user_id: int, start: datetime | None, end: datetime, scope: dict[str, Any] | None = None):
     conditions = [
         Transaction.user_id == user_id,
         Transaction.status == "normal",
@@ -369,17 +375,41 @@ def _base_filter(user_id: int, start: datetime | None, end: datetime):
     ]
     if start is not None:
         conditions.append(Transaction.occurred_at >= start)
+    for key in SCOPE_KEYS:
+        if scope and scope.get(key) is not None:
+            conditions.append(getattr(Transaction, key) == scope[key])
     return conditions
 
 
-def _totals(db: Session, user_id: int, start: datetime | None, end: datetime) -> dict[str, int]:
+def scope_labels(db: Session, user_id: int, scope: dict[str, Any] | None) -> dict[str, str]:
+    """Human-readable names of a scope, for the prompt and the answer card."""
+
+    labels: dict[str, str] = {}
+    if not scope:
+        return labels
+    lookups = (
+        ("payment_method_id", PaymentMethod, "账户"),
+        ("category_id", Category, "分类"),
+        ("partner_id", Partner, "往来单位"),
+    )
+    for key, model, label in lookups:
+        if scope.get(key) is not None:
+            name = db.scalar(select(model.name).where(model.id == scope[key], model.user_id == user_id))
+            if name:
+                labels[label] = str(name)
+    if scope.get("direction") in {"income", "expense"}:
+        labels["类型"] = "仅收入" if scope["direction"] == "income" else "仅支出"
+    return labels
+
+
+def _totals(db: Session, user_id: int, start: datetime | None, end: datetime, scope: dict[str, Any] | None = None) -> dict[str, int]:
     rows = db.execute(
         select(
             Transaction.direction,
             func.count(Transaction.id),
             func.coalesce(func.sum(Transaction.amount_cents), 0),
         )
-        .where(*_base_filter(user_id, start, end))
+        .where(*_base_filter(user_id, start, end, scope))
         .group_by(Transaction.direction)
     ).all()
     totals = {direction: (int(count), int(amount)) for direction, count, amount in rows}
@@ -405,8 +435,8 @@ def _tx_payload(tx: Transaction, category_name: str | None) -> dict[str, Any]:
     }
 
 
-def summarize_period(db: Session, user_id: int, spec: PeriodSpec, *, compare: bool = True) -> dict[str, Any]:
-    """Aggregate cash-flow transactions for a period.
+def summarize_period(db: Session, user_id: int, spec: PeriodSpec, *, compare: bool = True, scope: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Aggregate cash-flow transactions for a period, optionally within a scope.
 
     The result keeps the key names used by the existing analysis report
     (``transaction_count``, ``income_cents``, ``expense_cents``,
@@ -424,7 +454,10 @@ def summarize_period(db: Session, user_id: int, spec: PeriodSpec, *, compare: bo
     summary: dict[str, Any] = {"period": spec.as_dict()}
     if effective_start is not None:
         summary["period"]["start_date"] = effective_start.isoformat()
-    summary.update(_totals(db, user_id, start_utc, end_utc))
+    labels = scope_labels(db, user_id, scope)
+    if labels:
+        summary["scope"] = labels
+    summary.update(_totals(db, user_id, start_utc, end_utc, scope))
 
     category_rows = db.execute(
         select(
@@ -435,7 +468,7 @@ def summarize_period(db: Session, user_id: int, spec: PeriodSpec, *, compare: bo
         )
         .select_from(Transaction)
         .outerjoin(Category, Transaction.category_id == Category.id)
-        .where(*_base_filter(user_id, start_utc, end_utc))
+        .where(*_base_filter(user_id, start_utc, end_utc, scope))
         .group_by(Category.name, Transaction.direction)
     ).all()
     categories: dict[str, dict[str, int]] = {}
@@ -470,7 +503,7 @@ def summarize_period(db: Session, user_id: int, spec: PeriodSpec, *, compare: bo
 
     bucket_rows = db.execute(
         select(Transaction.occurred_at, Transaction.direction, Transaction.amount_cents)
-        .where(*_base_filter(user_id, start_utc, end_utc))
+        .where(*_base_filter(user_id, start_utc, end_utc, scope))
         .order_by(Transaction.occurred_at.desc())
         .limit(MAX_BUCKET_ROWS + 1)
     ).all()
@@ -497,14 +530,14 @@ def summarize_period(db: Session, user_id: int, spec: PeriodSpec, *, compare: bo
     largest_expense_rows = db.execute(
         select(Transaction, Category.name)
         .outerjoin(Category, Transaction.category_id == Category.id)
-        .where(*_base_filter(user_id, start_utc, end_utc), Transaction.direction == "expense")
+        .where(*_base_filter(user_id, start_utc, end_utc, scope), Transaction.direction == "expense")
         .order_by(Transaction.amount_cents.desc(), Transaction.occurred_at.desc())
         .limit(TOP_TRANSACTIONS)
     ).all()
     largest_income_rows = db.execute(
         select(Transaction, Category.name)
         .outerjoin(Category, Transaction.category_id == Category.id)
-        .where(*_base_filter(user_id, start_utc, end_utc), Transaction.direction == "income")
+        .where(*_base_filter(user_id, start_utc, end_utc, scope), Transaction.direction == "income")
         .order_by(Transaction.amount_cents.desc(), Transaction.occurred_at.desc())
         .limit(TOP_TRANSACTIONS)
     ).all()
@@ -523,7 +556,7 @@ def summarize_period(db: Session, user_id: int, spec: PeriodSpec, *, compare: bo
     previous = previous_period(spec) if compare else None
     if previous is not None:
         prev_start, prev_end = _bounds(previous)
-        prev_totals = _totals(db, user_id, prev_start, prev_end)
+        prev_totals = _totals(db, user_id, prev_start, prev_end, scope)
         summary["previous"] = {**previous.as_dict(), **prev_totals}
         summary["change"] = {
             "income_cents": summary["income_cents"] - prev_totals["income_cents"],

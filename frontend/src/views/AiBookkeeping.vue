@@ -55,6 +55,9 @@
       :categories-for-batch-draft="categoriesForBatchDraft"
       :confirm-batch="confirmBatch"
       :thinking="thinking"
+      :calibration="calibration"
+      :calibration-summary="calibrationSummary"
+      :calibration-categories="calibrationCategories"
     />
 
     <template v-else>
@@ -62,7 +65,7 @@
       <div class="compose-modebar">
         <div class="compose-mode-current"><span class="compose-mode-icon" aria-hidden="true">{{ isPartnerMode ? '↔' : isCombinedMode ? '✦' : '●' }}</span><div><strong>{{ isBatchMode ? `AI 已整理出 ${batchDrafts.length} 笔记录` : isPartnerMode ? 'AI 已识别为未结算余额' : isCombinedMode ? 'AI 会同时整理现金与未结算余额' : 'AI 已识别为现金收支' }}</strong><span>不用选择模式，一句话里包含的变化会自动分账</span></div></div>
       </div>
-      <div class="section-heading"><div class="ai-badge">{{ isPartnerMode ? '↔' : '✦' }}</div><div><h2>说一句话，记账、查收支、要报告都可以</h2><p>AI 会自动判断这是现金收支、往来余额变化，还是两者同时发生；一句话里说了多笔，会拆成多条记录供你勾选。也可以直接问本月、本年或全部的收支情况，或让它生成收支报告。记账在确认前不会写入账本。</p></div></div>
+      <div class="section-heading"><div class="ai-badge">{{ isPartnerMode ? '↔' : '✦' }}</div><div><h2>说一句话，AI 帮你记账</h2><p>AI 会自动判断这是现金收支、往来余额变化、账户转账还是余额校准；一句话里说了多笔，会拆成多条记录供你勾选。记账在确认前不会写入账本。查账和生成报告请到收支记录页。</p></div></div>
       <div class="ai-flow" aria-label="AI 记账流程"><span class="ai-flow-step is-active"><b>1</b>描述</span><i aria-hidden="true">→</i><span class="ai-flow-step"><b>2</b>AI 整理</span><i aria-hidden="true">→</i><span class="ai-flow-step"><b>3</b>一次确认</span></div>
       <div v-if="parseSourceLabel || parseWarning" class="parse-result-meta" role="status" aria-live="polite">
         <span v-if="parseSourceLabel" class="parse-source-badge" :class="{ 'is-fallback': isFallbackParse }"><i aria-hidden="true"></i>{{ parseSourceLabel }}</span>
@@ -79,12 +82,12 @@
 
     <section v-if="conversation.length" class="conversation panel">
       <div class="panel-title"><div><h2>对话</h2><p>继续补充即可，确认前不会写入账本</p></div><button class="text-button" type="button" title="清空本轮对话和已解析草稿" @click="resetConversation">清空对话与草稿</button></div>
-      <div ref="conversationThread" class="messages" aria-live="polite"><div v-for="(message, index) in conversation" :key="`${index}-${message.content}`" class="message" :class="[message.role === 'user' ? 'user-message' : 'assistant-message', { 'chat-message': message.kind === 'chat' }]"><span class="message-avatar">{{ message.role === 'user' ? '我' : '✦' }}</span><AiThinkingPanel v-if="message.kind === 'thinking'" v-model:open="message.open" :entries="message.entries" :seconds="message.seconds" /><div v-else class="message-bubble"><p>{{ message.content }}</p><router-link v-if="message.report_id" class="message-link" :to="{ path: '/reports', query: { report: message.report_id } }">报告已保存，在财务分析中查看 →</router-link></div></div><div v-if="parsing" class="message assistant-message parsing-message"><span class="message-avatar">✦</span><AiThinkingPanel v-if="thinking.active" v-model:open="thinking.open" active :entries="thinking.entries" :seconds="thinking.seconds" :stage="retryStatus || thinking.stage" /><p v-else><span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>{{ retryStatus || parsingLabel }} <span aria-hidden="true">↓</span></p></div></div>
+      <div ref="conversationThread" class="messages" aria-live="polite"><div v-for="(message, index) in conversation" :key="`${index}-${message.content}`" class="message" :class="[message.role === 'user' ? 'user-message' : 'assistant-message', { 'chat-message': message.kind === 'chat' }]"><span class="message-avatar">{{ message.role === 'user' ? '我' : '✦' }}</span><AiThinkingPanel v-if="message.kind === 'thinking'" v-model:open="message.open" :entries="message.entries" :seconds="message.seconds" /><div v-else class="message-bubble"><p>{{ message.content }}</p><router-link v-if="message.report_id" class="message-link" :to="{ path: '/reports', query: { report: message.report_id } }">报告已保存，在财务分析中查看 →</router-link><router-link v-if="message.link" class="message-link" :to="message.link.to">{{ message.link.label }}</router-link></div></div><div v-if="parsing" class="message assistant-message parsing-message"><span class="message-avatar">✦</span><AiThinkingPanel v-if="thinking.active" v-model:open="thinking.open" active :entries="thinking.entries" :seconds="thinking.seconds" :stage="retryStatus || thinking.stage" /><p v-else><span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>{{ retryStatus || parsingLabel }} <span aria-hidden="true">↓</span></p></div></div>
     </section>
 
     <section v-if="draftVisible" class="confirm-card panel" :class="{ 'partner-confirm-card': isPartnerMode, 'combined-confirm-card': combinedVisible }">
-      <div class="panel-title"><div><h2>{{ isPartnerMode ? '确认未结算余额' : isTransferDraft ? '确认账户转账/还款' : combinedVisible ? '确认现金与未结算余额' : '确认现金入账' }}</h2><p>{{ isPartnerMode ? '只确认当前未结算余额，不会产生现金流水' : isTransferDraft ? '只移动账户余额，不计入收入或支出。' : combinedVisible ? '以下两部分会在同一事务中确认' : '请核对后点击确认，AI 不会在确认前写入现金账' }}</p></div><span class="draft-status">待确认</span></div>
-      <p class="draft-progress" :class="{ ready: draftReady }" role="status">{{ draftReady ? (isPartnerMode ? '信息已齐全，可以确认未结算余额。' : isTransferDraft ? '信息已齐全，可以确认转账/还款。' : '信息已齐全，可以确认入账。') : `还需补充：${draftMissingFields.join('、')}` }}</p>
+      <div class="panel-title"><div><h2>{{ isPartnerMode ? '确认未结算余额' : isBalanceCheckDraft ? '确认余额校准' : isTransferDraft ? '确认账户转账/还款' : combinedVisible ? '确认现金与未结算余额' : '确认现金入账' }}</h2><p>{{ isPartnerMode ? '只确认当前未结算余额，不会产生现金流水' : isBalanceCheckDraft ? '按实际余额与系统记录的差额生成一笔流水' : isTransferDraft ? '只移动账户余额，不计入收入或支出。' : combinedVisible ? '以下两部分会在同一事务中确认' : '请核对后点击确认，AI 不会在确认前写入现金账' }}</p></div><span class="draft-status">待确认</span></div>
+      <p class="draft-progress" :class="{ ready: draftReady }" role="status">{{ draftReady ? (isPartnerMode ? '信息已齐全，可以确认未结算余额。' : isBalanceCheckDraft ? '差额已算出，可以确认校准。' : isTransferDraft ? '信息已齐全，可以确认转账/还款。' : '信息已齐全，可以确认入账。') : `还需补充：${draftMissingFields.join('、')}` }}</p>
       <form class="draft-form" @submit.prevent="confirmDraft">
         <template v-if="isPartnerMode">
           <div class="partner-mode-summary" v-if="partnerCurrent"><span class="partner-mode-avatar">{{ partnerCurrent.type === 'customer' ? '客' : '供' }}</span><div><strong>{{ partnerCurrent.name }}</strong><small>{{ partnerCurrent.type === 'customer' ? '客户' : '供应商' }}往来账户</small></div><span class="partner-balance-chip">系统记录 {{ formatMoney(partnerCurrentBalance) }}</span></div>
@@ -105,9 +108,11 @@
           <label v-if="partnerEntryRows[0]?.balance_after" class="reconciliation-toggle"><input v-model="partnerBalance.apply_reconciliation" type="checkbox" /><span><strong>同步校准账面余额</strong><small>开启后，系统会按差额生成一条可追溯的余额校准流水。</small></span></label>
         </template>
         <template v-else>
-          <div v-if="!isTransferDraft" class="draft-direction"><button type="button" :class="{ selected: draft.direction === 'expense' }" @click="draft.direction = 'expense'">现金流出</button><button type="button" :class="{ selected: draft.direction === 'income' }" @click="draft.direction = 'income'">现金流入</button></div>
-          <p v-else class="transfer-hint">这笔会按内部转账处理：来源账户余额减少；目标为负债账户时欠款减少，目标为现金/投资账户时余额增加。</p>
-          <div class="draft-grid"><label>金额（元）<input v-model.trim="draft.amount" inputmode="decimal" pattern="^[0-9]+([.][0-9]{1,2})?$" required /></label><label>发生时间<input v-model="draft.occurred_at" type="datetime-local" required /></label><label v-if="!isTransferDraft">分类<select v-model="draft.category_id" required @change="syncCategoryDirection"><option value="" disabled>请选择分类</option><option v-for="item in availableCategories" :key="item.id" :value="String(item.id)">{{ item.name }}</option></select></label><label>{{ isTransferDraft ? '来源账户' : draft.direction === 'income' ? '收款账户' : '支付账户' }}<select v-model="draft.payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="item in paymentMethods" :key="item.id" :value="String(item.id)">{{ paymentMethodOptionLabel(item) }}</option></select></label><label v-if="isTransferDraft">转入/还款账户<select v-model="draft.transfer_payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="item in paymentMethods" :key="item.id" :value="String(item.id)">{{ paymentMethodOptionLabel(item) }}</option></select></label><label v-else>关联客户/供应商（仅标签）<select v-model="draft.partner_id"><option value="">不关联</option><option v-for="item in partners" :key="item.id" :value="String(item.id)">{{ item.name }}</option></select></label><label>备注<textarea v-model.trim="draft.notes" rows="1" maxlength="500"></textarea></label></div>
+          <div v-if="!isTransferDraft && !isBalanceCheckDraft" class="draft-direction"><button type="button" :class="{ selected: draft.direction === 'expense' }" @click="draft.direction = 'expense'">现金流出</button><button type="button" :class="{ selected: draft.direction === 'income' }" @click="draft.direction = 'income'">现金流入</button></div>
+          <div v-else-if="isBalanceCheckDraft" class="partner-balance-comparison calibration-compare"><div class="partner-balance-side is-current"><span>系统当前记录</span><strong>{{ formatMoney(calibration.stored) }}</strong><small>{{ calibration.account ? paymentMethodOptionLabel(calibration.account) : '请先选择账户' }}</small></div><span class="partner-balance-arrow" aria-hidden="true">→</span><label class="partner-balance-side is-target"><span>{{ calibration.liability ? '实际欠款（元）' : '实际余额（元）' }}</span><input v-model.trim="draft.account_balance" inputmode="decimal" pattern="^[0-9]+([.][0-9]{1,2})?$" required placeholder="例如：2345.67" /><small>来自你的描述，可以手动修正</small></label></div>
+          <p v-if="isBalanceCheckDraft" class="calibration-summary" :class="{ 'is-ready': calibration.delta !== null && calibration.delta !== 0 }"><span aria-hidden="true">✓</span>{{ calibrationSummary }}</p>
+          <p v-else-if="isTransferDraft" class="transfer-hint">这笔会按内部转账处理：来源账户余额减少；目标为负债账户时欠款减少，目标为现金/投资账户时余额增加。</p>
+          <div class="draft-grid"><label v-if="!isBalanceCheckDraft">金额（元）<input v-model.trim="draft.amount" inputmode="decimal" pattern="^[0-9]+([.][0-9]{1,2})?$" required /></label><label>发生时间<input v-model="draft.occurred_at" type="datetime-local" required /></label><label v-if="!isTransferDraft">分类<select v-model="draft.category_id" required @change="isBalanceCheckDraft ? null : syncCategoryDirection($event)"><option value="" disabled>请选择分类</option><option v-for="item in (isBalanceCheckDraft ? calibrationCategories : availableCategories)" :key="item.id" :value="String(item.id)">{{ item.name }}</option></select></label><label>{{ isBalanceCheckDraft ? '校准账户' : isTransferDraft ? '来源账户' : draft.direction === 'income' ? '收款账户' : '支付账户' }}<select v-model="draft.payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="item in paymentMethods" :key="item.id" :value="String(item.id)">{{ paymentMethodOptionLabel(item) }}</option></select></label><label v-if="isTransferDraft">转入/还款账户<select v-model="draft.transfer_payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="item in paymentMethods" :key="item.id" :value="String(item.id)">{{ paymentMethodOptionLabel(item) }}</option></select></label><label v-else-if="!isBalanceCheckDraft">关联客户/供应商（仅标签）<select v-model="draft.partner_id"><option value="">不关联</option><option v-for="item in partners" :key="item.id" :value="String(item.id)">{{ item.name }}</option></select></label><label>备注<textarea v-model.trim="draft.notes" rows="1" maxlength="500" :placeholder="isBalanceCheckDraft ? '留空则自动写入“余额校准：系统 → 实际”' : ''"></textarea></label></div>
           <div v-if="combinedVisible" class="partner-ledger-confirm combined-ledger-panel">
             <div class="combined-ledger-head"><span class="combined-ledger-icon" aria-hidden="true">↔</span><div><strong>记录未结算余额</strong><span>AI 已识别，将与现金流水一次确认</span></div><em>同一笔记录</em></div>
             <div class="combined-ledger-summary"><div><small>往来账户</small><strong>{{ draft.partner_id ? (partners.find((item) => String(item.id) === String(draft.partner_id))?.name || draftNames.partner || '待选择') : (draftNames.partner || '待选择') }}</strong></div><div><small>当前未结算余额</small><strong>{{ Number.isInteger(partnerBalance.after_cents) ? formatMoney(partnerBalance.after_cents) : '待补充' }}</strong></div><div><small>AI 识别</small><strong>{{ partnerLedger.type ? partnerLedgerLabel(partnerLedger.type) : '未设置' }}</strong></div></div>
@@ -117,7 +122,7 @@
           </div>
         </template>
         <div v-if="confirmError" class="form-error" role="alert">{{ confirmError }}</div>
-        <div class="confirm-actions"><button class="outline-button" type="button" title="清空本轮对话和已解析草稿" @click="resetConversation" :disabled="confirming">清空对话与草稿</button><button class="primary" type="submit" :disabled="confirming || !draftReady"><span v-if="confirming" class="spinner"></span>{{ confirming ? '确认中…' : isPartnerMode ? '确认未结算余额' : isTransferDraft ? '确认转账/还款' : combinedVisible ? '确认现金 + 往来' : '确认现金入账' }}</button></div>
+        <div class="confirm-actions"><button class="outline-button" type="button" title="清空本轮对话和已解析草稿" @click="resetConversation" :disabled="confirming">清空对话与草稿</button><button class="primary" type="submit" :disabled="confirming || !draftReady"><span v-if="confirming" class="spinner"></span>{{ confirming ? '确认中…' : isPartnerMode ? '确认未结算余额' : isBalanceCheckDraft ? '确认余额校准' : isTransferDraft ? '确认转账/还款' : combinedVisible ? '确认现金 + 往来' : '确认现金入账' }}</button></div>
       </form>
     </section>
 
@@ -132,8 +137,9 @@
             <em v-if="item.selected && batchDraftMissing(item).length" class="batch-item-missing">还需补充：{{ batchDraftMissing(item).join('、') }}</em>
           </header>
           <template v-if="item.selected">
-            <div class="draft-direction batch-type" role="group" :aria-label="`第 ${index + 1} 笔的类型`"><button type="button" :class="{ selected: !isTransferItem(item) && item.direction === 'expense' }" @click="setBatchDraftType(item, 'expense')">现金流出</button><button type="button" :class="{ selected: !isTransferItem(item) && item.direction === 'income' }" @click="setBatchDraftType(item, 'income')">现金流入</button><button type="button" :class="{ selected: isTransferItem(item) }" @click="setBatchDraftType(item, 'transfer')">转账/还款</button></div>
-            <div class="draft-grid"><label>金额（元）<input v-model.trim="item.amount" inputmode="decimal" pattern="^[0-9]+([.][0-9]{1,2})?$" required /></label><label>发生时间<input v-model="item.occurred_at" type="datetime-local" required /></label><label v-if="!isTransferItem(item)">分类<select v-model="item.category_id" required><option value="" disabled>请选择分类</option><option v-for="category in categoriesForBatchDraft(item)" :key="category.id" :value="String(category.id)">{{ category.name }}</option></select></label><label>{{ isTransferItem(item) ? '来源账户' : item.direction === 'income' ? '收款账户' : '支付账户' }}<select v-model="item.payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="method in paymentMethods" :key="method.id" :value="String(method.id)">{{ paymentMethodOptionLabel(method) }}</option></select></label><label v-if="isTransferItem(item)">转入/还款账户<select v-model="item.transfer_payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="method in paymentMethods" :key="method.id" :value="String(method.id)">{{ paymentMethodOptionLabel(method) }}</option></select></label><label v-else-if="partners.length">关联客户/供应商（仅标签）<select v-model="item.partner_id"><option value="">不关联</option><option v-for="partner in partners" :key="partner.id" :value="String(partner.id)">{{ partner.name }}</option></select></label><label>备注<textarea v-model.trim="item.notes" rows="1" maxlength="500"></textarea></label></div>
+            <p v-if="isBalanceItem(item)" class="calibration-summary" :class="{ 'is-ready': batchCalibration(item).delta }"><span aria-hidden="true">✓</span>{{ calibrationText(batchCalibration(item)) }}</p>
+            <div v-else class="draft-direction batch-type" role="group" :aria-label="`第 ${index + 1} 笔的类型`"><button type="button" :class="{ selected: !isTransferItem(item) && item.direction === 'expense' }" @click="setBatchDraftType(item, 'expense')">现金流出</button><button type="button" :class="{ selected: !isTransferItem(item) && item.direction === 'income' }" @click="setBatchDraftType(item, 'income')">现金流入</button><button type="button" :class="{ selected: isTransferItem(item) }" @click="setBatchDraftType(item, 'transfer')">转账/还款</button></div>
+            <div class="draft-grid"><label v-if="isBalanceItem(item)">{{ batchCalibration(item).liability ? '实际欠款（元）' : '实际余额（元）' }}<input v-model.trim="item.account_balance" inputmode="decimal" pattern="^[0-9]+([.][0-9]{1,2})?$" required /></label><label v-else>金额（元）<input v-model.trim="item.amount" inputmode="decimal" pattern="^[0-9]+([.][0-9]{1,2})?$" required /></label><label>发生时间<input v-model="item.occurred_at" type="datetime-local" required /></label><label v-if="!isTransferItem(item) && !isBalanceItem(item)">分类<select v-model="item.category_id" required><option value="" disabled>请选择分类</option><option v-for="category in categoriesForBatchDraft(item)" :key="category.id" :value="String(category.id)">{{ category.name }}</option></select></label><label>{{ isBalanceItem(item) ? '校准账户' : isTransferItem(item) ? '来源账户' : item.direction === 'income' ? '收款账户' : '支付账户' }}<select v-model="item.payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="method in paymentMethods" :key="method.id" :value="String(method.id)">{{ paymentMethodOptionLabel(method) }}</option></select></label><label v-if="isTransferItem(item)">转入/还款账户<select v-model="item.transfer_payment_method_id" required><option value="" disabled>请选择账户</option><option v-for="method in paymentMethods" :key="method.id" :value="String(method.id)">{{ paymentMethodOptionLabel(method) }}</option></select></label><label v-else-if="partners.length && !isBalanceItem(item)">关联客户/供应商（仅标签）<select v-model="item.partner_id"><option value="">不关联</option><option v-for="partner in partners" :key="partner.id" :value="String(partner.id)">{{ partner.name }}</option></select></label><label>备注<textarea v-model.trim="item.notes" rows="1" maxlength="500"></textarea></label></div>
           </template>
         </article>
         <div v-if="confirmError" class="form-error" role="alert">{{ confirmError }}</div>
@@ -146,10 +152,10 @@
         <label class="sr-only" for="desktop-ai-prompt-input">记账描述</label>
         <textarea id="desktop-ai-prompt-input" ref="promptInput" v-model.trim="prompt" :disabled="parsing || confirming" rows="1" maxlength="1000" placeholder="描述一笔或多笔收支、往来…" @keydown.enter.exact.prevent="submitPrompt"></textarea>
         <div class="quick-prompts" aria-label="常用描述示例">
-          <span>快速开始</span>
-          <button v-for="example in quickPrompts" :key="example.label" type="button" :disabled="parsing || confirming" @click="useQuickPrompt(example.text)">{{ example.label }}</button>
+          <span>可以这样说</span>
+<span v-for="example in quickPrompts" :key="example.label" class="quick-prompt" :title="example.text">{{ example.label }}：{{ example.text }}</span>
         </div>
-        <div class="prompt-foot"><span aria-live="polite">{{ parsing ? (retryStatus || 'AI 正在处理…') : conversation.length ? '继续补充记录，或直接提问收支情况' : 'Enter 发送 · Shift + Enter 换行' }}</span><button class="chat-send" type="submit" :disabled="!prompt || parsing || confirming" :aria-label="parsing ? '解析中' : '发送'" :title="parsing ? '解析中' : '发送'"><span v-if="parsing" class="spinner"></span><span v-else aria-hidden="true">↑</span></button></div>
+        <div class="prompt-foot"><span aria-live="polite">{{ parsing ? (retryStatus || 'AI 正在处理…') : conversation.length ? '继续补充这笔记录' : 'Enter 发送 · Shift + Enter 换行' }}</span><button class="chat-send" type="submit" :disabled="!prompt || parsing || confirming" :aria-label="parsing ? '解析中' : '发送'" :title="parsing ? '解析中' : '发送'"><span v-if="parsing" class="spinner"></span><span v-else aria-hidden="true">↑</span></button></div>
       </form>
     </section>
 
@@ -193,7 +199,7 @@ const pageSubtitle = computed(() => selectedPartner.value ? `${selectedPartner.v
 const prompt = ref('')
 const conversation = ref([])
 const conversationId = ref(null)
-const draft = reactive({ kind: 'cashflow', direction: 'expense', amount: '', occurred_at: localDateTimeValue(), category_id: '', payment_method_id: '', transfer_payment_method_id: '', partner_id: '', notes: '' })
+const draft = reactive({ kind: 'cashflow', direction: 'expense', amount: '', account_balance: '', occurred_at: localDateTimeValue(), category_id: '', payment_method_id: '', transfer_payment_method_id: '', partner_id: '', notes: '' })
 const draftNames = reactive({ category: '', method: '', partner: '' })
 const partnerLedger = reactive({ type: '', amount_cents: null, amount_text: '', enabled: false })
 const partnerBalance = reactive({
@@ -229,6 +235,9 @@ const reviewHint = '请向下滑动查看并核对本轮结果。'
 const aiUnavailable = ref(false)
 const retryStatus = ref('')
 const parsingLabel = ref('正在整理这笔记录，完成后向下核对')
+// Set when the backend classifies the sentence as a question: this page only
+// books, so the thread points at the transactions page instead.
+const questionHint = ref('')
 const requestError = ref(null)
 const notice = ref(null)
 const categories = ref([])
@@ -245,13 +254,38 @@ const quickPrompts = [
   { label: '收到一笔款项', text: '今天收到客户货款 3500 元，微信到账' },
   { label: '现金 + 往来', text: '支付宝扫了 1000 元给供应商王先生，供应商网站现在余额 760 元' },
   { label: '记录余额', text: '客户王先生目前未结算余额 12000 元' },
-  { label: '本月收支', text: '本月收支情况怎么样？' },
-  { label: '本年收支', text: '今年收入和支出各是多少？' },
-  { label: '生成月报', text: '生成本月收支报告' },
+  { label: '校准余额', text: '支付宝现在实际余额 2345.67 元' },
 ]
 
 const availableCategories = computed(() => categories.value.filter((item) => item.is_active !== false && (!item.direction || !['income', 'expense'].includes(draft.direction) || item.direction === draft.direction)))
 const isTransferDraft = computed(() => String(draft.kind || '').toLowerCase() === 'transfer')
+const isBalanceCheckDraft = computed(() => String(draft.kind || '').toLowerCase() === 'balance_check')
+// A balance report is booked as the difference to the stored balance; on a
+// liability account the balance is debt, so more debt is an expense.
+function calibrationFor(methodId, balanceText) {
+  const account = paymentMethods.value.find((item) => String(item.id) === String(methodId)) || null
+  const reported = amountToCents(balanceText)
+  const stored = Number(account?.current_balance_cents ?? 0)
+  const delta = Number.isInteger(reported) ? reported - stored : null
+  const liability = account?.account_role === 'liability'
+  const direction = delta === null || delta === 0 ? '' : (delta > 0) !== liability ? 'income' : 'expense'
+  return { account, stored, reported: Number.isInteger(reported) ? reported : null, delta, liability, direction }
+}
+function calibrationText({ delta, direction, liability }) {
+  if (delta === null) return '填写账户当前的实际余额后，系统会算出差额。'
+  if (delta === 0) return '与系统记录一致，不需要校准。'
+  return `将生成一笔${direction === 'income' ? '收入' : '支出'} ${formatMoney(Math.abs(delta))}${liability ? `（欠款${delta > 0 ? '增加' : '减少'}）` : ''}。`
+}
+const calibration = computed(() => calibrationFor(draft.payment_method_id, draft.account_balance))
+const calibrationSummary = computed(() => calibrationText(calibration.value))
+const calibrationCategories = computed(() => categories.value.filter((item) => item.is_active !== false && (!item.direction || !calibration.value.direction || item.direction === calibration.value.direction)))
+watch(() => [isBalanceCheckDraft.value, calibration.value.direction], ([active, direction]) => {
+  if (!active) return
+  const current = categories.value.find((item) => String(item.id) === String(draft.category_id))
+  if (current && (!current.direction || !direction || current.direction === direction)) return
+  const fallback = categories.value.find((item) => item.name === (direction === 'income' ? '其他收入' : '其他支出')) || calibrationCategories.value[0]
+  draft.category_id = direction && fallback ? String(fallback.id) : ''
+})
 const partnerPromptExamples = quickPrompts.map((item) => item.text)
 const partnerCurrent = computed(() => selectedPartner.value || partners.value.find((item) => String(item.id) === String(draft.partner_id)) || null)
 const partnerCurrentType = computed(() => String(partnerCurrent.value?.type || '').toLowerCase())
@@ -320,7 +354,7 @@ const partnerCurrentBalance = computed(() => {
   if (kind === 'credit_remaining' || kind === 'available_credit') return Number(partner.credit_remaining_cents ?? ((partner.credit_limit_cents || 0) - (partner.credit_used_cents || 0)))
   return Number(partner.prepaid_balance_cents || 0)
 })
-const cashDraftVisible = computed(() => conversation.value.length > 0 && (Boolean(draft.amount) || Boolean(draft.category_id) || Boolean(draft.payment_method_id) || Boolean(draft.transfer_payment_method_id) || Boolean(draft.partner_id) || isTransferDraft.value))
+const cashDraftVisible = computed(() => conversation.value.length > 0 && (isBalanceCheckDraft.value || Boolean(draft.amount) || Boolean(draft.category_id) || Boolean(draft.payment_method_id) || Boolean(draft.transfer_payment_method_id) || Boolean(draft.partner_id) || isTransferDraft.value))
 const partnerDraftVisible = computed(() => conversation.value.length > 0 && (Boolean(draft.partner_id || selectedPartnerId.value) || partnerEntryRows.value.some((row) => row.amount || row.balance_after || row.entry_type)))
 const isBatchMode = computed(() => batchDrafts.value.length > 1)
 const draftVisible = computed(() => !isBatchMode.value && (isPartnerMode.value ? partnerDraftVisible.value : cashDraftVisible.value))
@@ -332,6 +366,7 @@ const batchProgress = computed(() => {
   return pending.length ? `${pending.join('、')}还有信息需要补充，可以直接在卡片里修改，或继续对话让 AI 补充。` : `已勾选 ${selectedBatchDrafts.value.length} 笔，信息齐全，可以一次确认入账。`
 })
 const cashDraftReady = computed(() => {
+  if (isBalanceCheckDraft.value) return Boolean(draft.payment_method_id && draft.category_id) && calibration.value.delta !== null && calibration.value.delta !== 0
   const amount = amountToCents(draft.amount)
   if (!(Number.isInteger(amount) && amount > 0) || !draft.payment_method_id || !['income', 'expense'].includes(draft.direction)) return false
   if (isTransferDraft.value) return Boolean(draft.transfer_payment_method_id) && String(draft.transfer_payment_method_id) !== String(draft.payment_method_id)
@@ -355,7 +390,7 @@ const draftReady = computed(() => isPartnerMode.value ? partnerDraftReady.value 
 // Only show the current-account section when a real partner ledger action was
 // parsed.  The page starts in a neutral unified state; that state alone must
 // never turn an ordinary cash draft into a disabled “现金 + 往来” form.
-const combinedVisible = computed(() => !isPartnerMode.value && !isTransferDraft.value && Boolean(partnerLedger.type && (draft.partner_id || selectedPartnerId.value || draftNames.partner)))
+const combinedVisible = computed(() => !isPartnerMode.value && !isTransferDraft.value && !isBalanceCheckDraft.value && Boolean(partnerLedger.type && (draft.partner_id || selectedPartnerId.value || draftNames.partner)))
 const combinedEnabled = computed(() => combinedVisible.value && Boolean(partnerLedger.type && (draft.partner_id || selectedPartnerId.value || draftNames.partner)))
 const normalizedParseSource = computed(() => String(parseSource.value || '').trim().toLowerCase())
 const isFallbackParse = computed(() => normalizedParseSource.value === 'fallback')
@@ -375,6 +410,13 @@ const draftMissingFields = computed(() => {
     return missing
   }
   const missing = []
+  if (isBalanceCheckDraft.value) {
+    if (!draft.payment_method_id) missing.push('账户')
+    if (calibration.value.reported === null) missing.push('账户当前余额')
+    else if (calibration.value.delta === 0) missing.push('与系统记录不同的余额')
+    if (!draft.category_id) missing.push('分类')
+    return missing
+  }
   if (!(Number.isInteger(amountToCents(draft.amount)) && amountToCents(draft.amount) > 0)) missing.push('金额')
   if (!['income', 'expense'].includes(draft.direction)) missing.push('收支方向')
   if (!draft.payment_method_id) missing.push(isTransferDraft.value ? '来源账户' : draft.direction === 'income' ? '收款账户' : '支付账户')
@@ -391,11 +433,6 @@ const draftMissingFields = computed(() => {
   }
   return missing
 })
-
-function useQuickPrompt(text) {
-  prompt.value = text
-  nextTick(() => promptInput.value?.focus())
-}
 
 function scrollLatestUserMessageIntoView() {
   nextTick(() => {
@@ -510,10 +547,14 @@ function inferredProposalMode(raw) {
   return 'cash'
 }
 function isTransferItem(item) { return String(item?.kind || '').toLowerCase() === 'transfer' }
+function isBalanceItem(item) { return String(item?.kind || '').toLowerCase() === 'balance_check' }
+function batchCalibration(item) { return calibrationFor(item.payment_method_id, item.account_balance) }
 function batchDraftFromRecord(record, index) {
   const raw = firstObject(record?.parsed, record)
-  const kind = String(field(raw, 'kind')).toLowerCase() === 'transfer' ? 'transfer' : 'cashflow'
+  const rawKind = String(field(raw, 'kind')).toLowerCase()
+  const kind = rawKind === 'transfer' ? 'transfer' : rawKind === 'balance_check' ? 'balance_check' : 'cashflow'
   const amountCents = field(raw, 'amount_cents')
+  const balanceCents = field(raw, 'account_balance_cents')
   const occurred = field(raw, 'occurred_at')
   return {
     key: `${Date.now()}-${index}`,
@@ -521,6 +562,7 @@ function batchDraftFromRecord(record, index) {
     kind,
     direction: kind === 'transfer' ? 'expense' : (['income', 'expense'].includes(raw.direction) ? raw.direction : ''),
     amount: amountCents === '' ? '' : (Number(amountCents) / 100).toFixed(2),
+    account_balance: balanceCents === '' ? '' : (Number(balanceCents) / 100).toFixed(2),
     occurred_at: occurred ? localDateTimeValue(occurred) : localDateTimeValue(),
     category_id: kind === 'transfer' ? '' : resolveId(field(raw, 'category_id'), field(raw, 'category_name'), categories.value),
     payment_method_id: resolveId(field(raw, 'payment_method_id'), field(raw, 'payment_method_name'), paymentMethods.value),
@@ -539,6 +581,14 @@ function setBatchDraftType(item, type) {
 function categoriesForBatchDraft(item) { return categories.value.filter((entry) => entry.is_active !== false && (!entry.direction || entry.direction === item.direction)) }
 function batchDraftMissing(item) {
   const missing = []
+  if (isBalanceItem(item)) {
+    const { reported, delta } = batchCalibration(item)
+    if (!item.payment_method_id) missing.push('账户')
+    if (reported === null) missing.push('账户当前余额')
+    else if (delta === 0) missing.push('与系统记录不同的余额')
+    if (!datetimeLocalToUtcIso(item.occurred_at)) missing.push('发生时间')
+    return missing
+  }
   const amount = amountToCents(item.amount)
   if (!(Number.isInteger(amount) && amount > 0)) missing.push('金额')
   if (!datetimeLocalToUtcIso(item.occurred_at)) missing.push('发生时间')
@@ -555,6 +605,10 @@ function batchDraftMissing(item) {
 }
 function batchDraftSummary(item) {
   const methodName = (id) => paymentMethods.value.find((entry) => String(entry.id) === String(id))?.name || ''
+  if (isBalanceItem(item)) {
+    const { stored, reported, delta } = batchCalibration(item)
+    return `余额校准 ${methodName(item.payment_method_id) || '账户待选'} · 系统 ${formatMoney(stored)} → 实际 ${reported === null ? '待补充' : formatMoney(reported)}${delta ? ` · 差额 ${delta > 0 ? '+' : '−'}${formatMoney(Math.abs(delta))}` : ''}`
+  }
   const amount = amountToCents(item.amount)
   const money = Number.isInteger(amount) && amount > 0 ? formatMoney(amount) : '金额待补充'
   if (isTransferItem(item)) return `转账/还款 ${money} · ${methodName(item.payment_method_id) || '来源待选'} → ${methodName(item.transfer_payment_method_id) || '目标待选'}`
@@ -589,6 +643,9 @@ function applyDraft(raw) {
     category_id: resolveId(field(raw, 'category_id'), categoryName, categories.value), payment_method_id: resolveId(field(raw, 'payment_method_id'), methodName, paymentMethods.value), transfer_payment_method_id: resolveId(field(raw, 'transfer_payment_method_id', 'target_payment_method_id', 'to_payment_method_id'), transferMethodName, paymentMethods.value), partner_id: resolvedPartnerId, notes: hasNotes ? String(raw.notes ?? raw.note ?? '') : (draft.notes || ''),
   })
   if (draft.kind === 'transfer') { draft.direction = 'expense'; draft.category_id = ''; draft.partner_id = ''; partnerLedger.enabled = false }
+  const reportedBalance = field(raw, 'account_balance_cents')
+  draft.account_balance = reportedBalance === '' ? '' : (Number(reportedBalance) / 100).toFixed(2)
+  if (draft.kind === 'balance_check') { draft.direction = ''; draft.amount = ''; draft.category_id = ''; draft.transfer_payment_method_id = ''; draft.partner_id = ''; partnerLedger.enabled = false }
   Object.assign(draftNames, { category: categoryName, method: methodName, partner: partnerName })
   const primaryPartnerAction = rawPartnerActions(raw?.__payload || raw, raw)[0] || firstObject(raw?.partner_action, raw?.__payload?.partner_action)
   const hasLedgerType = ['partner_ledger_type', 'ledger_type', 'entry_type'].some((key) => Object.prototype.hasOwnProperty.call(raw || {}, key))
@@ -723,6 +780,7 @@ function handleParseEvent(event) {
   else if (type === 'reasoning' && event.text) { appendThinking('reasoning', String(event.text)); thinking.stage = '模型正在思考…' }
   else if (type === 'content' && event.text) { appendThinking('output', String(event.text)); thinking.stage = '正在生成记账草稿…' }
   else if (type === 'status' && THINKING_STATUS[event.code]) appendThinking('step', THINKING_STATUS[event.code])
+  else if (type === 'intent' && ['query', 'report'].includes(event.intent)) questionHint.value = event.intent
 }
 // Keep the finished process in the thread, collapsed, so it can be reopened.
 function finishThinking() {
@@ -739,30 +797,6 @@ function pushReviewBubbles(...contents) {
   })
 }
 
-async function answerLedgerQuestion(text, priorMessages, reference_time, requestOptions) {
-  const chatContext = priorMessages.filter((message) => message.kind === 'chat').slice(-12).map(({ role, content }) => ({ role, content }))
-  let payload
-  try {
-    payload = await aiApi.chat({ text, conversation: chatContext, reference_time }, requestOptions)
-  } catch (error) {
-    // An older backend without the assistant route simply parses as before.
-    if (endpointMissing(error)) return false
-    throw error
-  }
-  const intent = String(payload?.intent || 'bookkeeping').toLowerCase()
-  if (intent === 'bookkeeping' || !payload?.reply) return false
-  const userMessage = conversation.value[conversation.value.length - 1]
-  if (userMessage?.role === 'user') userMessage.kind = 'chat'
-  parseSource.value = String(payload?.source || '')
-  parseWarning.value = String(payload?.warning || '')
-  conversation.value.push({ role: 'assistant', content: String(payload.reply).trim(), kind: 'chat', report_id: payload?.report_id || null, period: payload?.period || null })
-  if (payload?.report_id) {
-    notice.value = { type: 'success', message: `${payload?.period?.label || '该周期'}收支报告已生成并保存到财务分析。` }
-    await loadHistory()
-  }
-  return true
-}
-
 async function submitPrompt() {
   const text = prompt.value.trim(); if (!text) return
   parsing.value = true; aiUnavailable.value = false; retryStatus.value = ''; requestError.value = null; confirmError.value = ''; parseSource.value = ''; parseWarning.value = ''
@@ -771,15 +805,10 @@ async function submitPrompt() {
     const priorMessages = conversation.value.slice(0, -1)
     const reference_time = utcNowIso()
     const requestOptions = { onRetry: retryProgress }
-    // Ask the ledger assistant first.  A question or report request is
-    // answered from aggregated data; a bookkeeping sentence comes back as
-    // ``intent: bookkeeping`` and continues with the strict parse flow below.
-    parsingLabel.value = '正在查看账本数据…'
-    const handled = await answerLedgerQuestion(text, priorMessages, reference_time, requestOptions)
-    if (handled) return
     parsingLabel.value = '正在整理这笔记录，完成后向下核对'
+    questionHint.value = ''
     // Earlier Q&A turns are not part of the transaction being described.
-    const priorConversation = priorMessages.filter((message) => !['chat', 'thinking'].includes(message.kind)).slice(-12).map(({ role, content }) => ({ role, content }))
+    const priorConversation = priorMessages.filter((message) => !['chat', 'thinking', 'hint'].includes(message.kind)).slice(-12).map(({ role, content }) => ({ role, content }))
     // Always ask for a unified proposal.  If the returned fields contain only
     // a virtual-account movement, transparently re-run the same sentence in
     // partner mode so the existing partner confirmation contract can be used.
@@ -788,7 +817,7 @@ async function submitPrompt() {
     let payload = await aiApi.parseStream('combined', { text, conversation: priorConversation, reference_time }, streamOptions)
     let raw = responseDraft(payload)
     const records = Array.isArray(payload?.records) ? payload.records : []
-    if (records.length > 1) { finishThinking(); applyBatchPayload(payload, records); return }
+    if (records.length > 1) { finishThinking(); if (questionHint.value) conversation.value.push({ role: 'assistant', kind: 'hint', content: '这句看起来是在查账。查账和报告请到收支记录页；这里只负责记账，下面仍按记账整理了。', link: { to: '/transactions', label: '前往收支记录 →' } }); applyBatchPayload(payload, records); return }
     batchDrafts.value = []
     let proposalMode = inferredProposalMode(raw)
     if (proposalMode === 'partner') {
@@ -801,6 +830,7 @@ async function submitPrompt() {
       }
     }
     finishThinking()
+    if (questionHint.value) conversation.value.push({ role: 'assistant', kind: 'hint', content: questionHint.value === 'report' ? '要生成报告的话，请到收支记录页：选好日期和账户后点“生成报告”。这里只负责记账，下面仍按记账整理了这句话。' : '这句看起来是在查账。查账请到收支记录页，在那里可以按日期、账户、分类提问。这里只负责记账，下面仍按记账整理了这句话。', link: { to: '/transactions', label: '前往收支记录 →' } })
     conversationId.value = payload?.conversation_id || payload?.id || conversationId.value
     parseSource.value = String(payload?.source || '')
     parseWarning.value = String(payload?.warning || '')
@@ -830,7 +860,7 @@ async function submitPrompt() {
     else if (status === 'fallback' || status === 'error') { const question = responseQuestion(payload) || 'AI 暂时无法完整解析，请在下方确认卡片补齐信息。'; conversation.value.push({ role: 'assistant', content: question }) }
     else if (briefComment.value) { pushReviewBubbles(briefComment.value) }
     else if (isPartnerMode.value) { pushReviewBubbles('我已识别为往来账户变化，请核对后一次确认。') }
-    else { pushReviewBubbles(isTransferDraft.value ? '我已整理好这笔账户转账/还款，请核对来源和目标账户。' : isCombinedMode.value ? '我已同时整理好现金与往来两部分，请核对后一次确认。' : '我已整理好这笔现金记录，请核对后确认。') }
+    else { pushReviewBubbles(isBalanceCheckDraft.value ? '我已识别为余额校准，请核对账户和实际余额，确认后按差额生成一笔流水。' : isTransferDraft.value ? '我已整理好这笔账户转账/还款，请核对来源和目标账户。' : isCombinedMode.value ? '我已同时整理好现金与往来两部分，请核对后一次确认。' : '我已整理好这笔现金记录，请核对后确认。') }
   } catch (error) {
     finishThinking()
     retryStatus.value = ''
@@ -842,12 +872,13 @@ async function submitPrompt() {
   } finally { parsing.value = false }
 }
 
-function resetConversation() { conversation.value = []; conversationId.value = null; prompt.value = ''; parseSource.value = ''; parseWarning.value = ''; briefComment.value = ''; confirmError.value = ''; retryStatus.value = ''; requestError.value = null; aiUnavailable.value = false; batchDrafts.value = []; clearInterval(thinkingTimer); Object.assign(thinking, { active: false, stage: '', entries: [], seconds: 0 }); resetDraftState() }
-function resetDraftState() { partnerActions.value = []; partnerIntent.value = ''; resolvedMode.value = 'combined'; Object.assign(draftNames, { category: '', method: '', partner: '' }); Object.assign(partnerLedger, { type: '', amount_cents: null, amount_text: '', enabled: false }); Object.assign(partnerBalance, { after_cents: null, after_text: '', expected_cents: null, delta_cents: null, kind: defaultBalanceKindForPartnerType(partnerCurrentType.value), apply_reconciliation: false }); Object.assign(draft, { kind: 'cashflow', direction: 'expense', amount: '', occurred_at: localDateTimeValue(), category_id: '', payment_method_id: '', transfer_payment_method_id: '', partner_id: selectedPartnerId.value || '', notes: '' }); resetPartnerRows(); normalizePartnerSelections() }
+function resetConversation() { conversation.value = []; conversationId.value = null; prompt.value = ''; parseSource.value = ''; parseWarning.value = ''; briefComment.value = ''; confirmError.value = ''; retryStatus.value = ''; requestError.value = null; aiUnavailable.value = false; questionHint.value = ''; batchDrafts.value = []; clearInterval(thinkingTimer); Object.assign(thinking, { active: false, stage: '', entries: [], seconds: 0 }); resetDraftState() }
+function resetDraftState() { partnerActions.value = []; partnerIntent.value = ''; resolvedMode.value = 'combined'; Object.assign(draftNames, { category: '', method: '', partner: '' }); Object.assign(partnerLedger, { type: '', amount_cents: null, amount_text: '', enabled: false }); Object.assign(partnerBalance, { after_cents: null, after_text: '', expected_cents: null, delta_cents: null, kind: defaultBalanceKindForPartnerType(partnerCurrentType.value), apply_reconciliation: false }); Object.assign(draft, { kind: 'cashflow', direction: 'expense', amount: '', occurred_at: localDateTimeValue(), category_id: '', payment_method_id: '', transfer_payment_method_id: '', partner_id: selectedPartnerId.value || '', notes: '', account_balance: '' }); resetPartnerRows(); normalizePartnerSelections() }
 function normalizedCashDraft() {
   const cents = amountToCents(draft.amount)
   const occurred_at = datetimeLocalToUtcIso(draft.occurred_at)
   if (!occurred_at) throw new Error('请输入有效的北京时间。')
+  if (isBalanceCheckDraft.value) return { occurred_at, kind: 'balance_check', payment_method_id: Number(draft.payment_method_id), account_balance_cents: calibration.value.reported, category_id: Number(draft.category_id), notes: draft.notes || null }
   const partnerId = draft.partner_id || selectedPartnerId.value
   const value = { occurred_at, kind: isTransferDraft.value ? 'transfer' : 'cashflow', direction: isTransferDraft.value ? 'expense' : draft.direction, amount_cents: cents, category_id: isTransferDraft.value ? null : Number(draft.category_id), payment_method_id: Number(draft.payment_method_id), partner_id: isTransferDraft.value ? null : (partnerId ? Number(partnerId) : null), partner_name: isTransferDraft.value ? null : (!partnerId ? (draftNames.partner || null) : null), notes: draft.notes || null }
   if (isTransferDraft.value) {
@@ -906,6 +937,7 @@ async function confirmBatch() {
   const incomplete = batchDrafts.value.findIndex((item) => item.selected && batchDraftMissing(item).length)
   if (incomplete >= 0) { confirmError.value = `第 ${incomplete + 1} 笔还需补充：${batchDraftMissing(batchDrafts.value[incomplete]).join('、')}。`; return }
   const drafts = selected.map((item) => {
+    if (isBalanceItem(item)) return { occurred_at: datetimeLocalToUtcIso(item.occurred_at), kind: 'balance_check', payment_method_id: Number(item.payment_method_id), account_balance_cents: batchCalibration(item).reported, category_id: null, notes: item.notes || null }
     const transfer = isTransferItem(item)
     return { occurred_at: datetimeLocalToUtcIso(item.occurred_at), kind: transfer ? 'transfer' : 'cashflow', direction: transfer ? 'expense' : item.direction, amount_cents: amountToCents(item.amount), category_id: transfer ? null : Number(item.category_id), payment_method_id: Number(item.payment_method_id), transfer_payment_method_id: transfer ? Number(item.transfer_payment_method_id) : null, partner_id: !transfer && item.partner_id ? Number(item.partner_id) : null, notes: item.notes || null }
   })
@@ -914,13 +946,13 @@ async function confirmBatch() {
     const result = await aiApi.confirmBatch(drafts)
     const skipped = batchDrafts.value.length - selected.length
     notice.value = { type: 'success', message: `已确认 ${result?.transactions?.length || drafts.length} 笔记录${skipped ? `，未勾选的 ${skipped} 笔没有入账` : ''}。` }
-    await loadHistory(); resetConversation()
+    await Promise.all([loadHistory(), loadReferences()]); resetConversation()
   } catch (error) { confirmError.value = error instanceof ApiError ? error.message : '确认入账失败，请稍后重试。' }
   finally { confirming.value = false }
 }
 async function confirmDraft() {
   confirmError.value = ''
-  if (!draftReady.value) { confirmError.value = isPartnerMode.value ? `请补齐：${draftMissingFields.value.join('、') || '往来变动信息'}。` : isTransferDraft.value ? `请补齐：${draftMissingFields.value.join('、') || '来源和目标账户'}。` : '请补齐金额、分类和资金账户。'; return }
+  if (!draftReady.value) { confirmError.value = isPartnerMode.value ? `请补齐：${draftMissingFields.value.join('、') || '往来变动信息'}。` : isTransferDraft.value ? `请补齐：${draftMissingFields.value.join('、') || '来源和目标账户'}。` : `请补齐：${draftMissingFields.value.join('、') || '金额、分类和资金账户'}。`; return }
   let payload
   try { payload = isPartnerMode.value ? normalizedPartnerEntries() : normalizedCashDraft() } catch (error) { confirmError.value = error.message || '请输入有效的北京时间。'; return }
   confirming.value = true
@@ -973,7 +1005,7 @@ async function confirmDraft() {
         result = { partner_action: saved, balance_reconciliation: saved?.balance_reconciliation }
       }
     } else {
-      const cashPayload = { mode: isTransferDraft.value ? 'cash' : (isCombinedMode.value || combinedEnabled.value ? 'combined' : 'cash'), draft: payload, confirm: true }
+      const cashPayload = { mode: isTransferDraft.value || isBalanceCheckDraft.value ? 'cash' : (isCombinedMode.value || combinedEnabled.value ? 'combined' : 'cash'), draft: payload, confirm: true }
       if (combinedEnabled.value) {
         cashPayload.partner_ledger_type = partnerLedger.type || undefined
         cashPayload.partner_ledger_amount_cents = partnerLedger.amount_cents !== null && partnerLedger.amount_cents !== '' ? Math.abs(Number(partnerLedger.amount_cents)) : undefined
@@ -986,16 +1018,16 @@ async function confirmDraft() {
         // A combined confirmation must never degrade to cash-only: that would
         // leave the two books out of sync. A legacy cash endpoint may still be
         // used for plain cash mode only.
-        if (!endpointMissing(error) || cashPayload.mode === 'combined') throw error
+        if (!endpointMissing(error) || cashPayload.mode === 'combined' || isBalanceCheckDraft.value) throw error
         result = await transactionsApi.create({ ...payload, source: 'ai' })
       }
     }
     const transactionId = result?.transaction?.id || result?.id
     const confirmationWarning = result?.warning
     const actionCount = result?.partner_actions?.length || result?.partner_action ? (Array.isArray(result.partner_actions) ? result.partner_actions.length : 1) : payload?.entries?.length || 0
-    const successText = isPartnerMode.value ? `已确认 ${actionCount || 1} 条往来流水${result?.balance_reconciliation ? '，余额盘点已记录' : ''}。` : isTransferDraft.value ? `${confirmationWarning ? `${confirmationWarning} ` : ''}已确认账户转账/还款${transactionId ? `（流水 #${transactionId}）` : ''}。` : `${confirmationWarning ? `${confirmationWarning} ` : ''}已确认现金记账${transactionId ? `（流水 #${transactionId}）` : ''}${combinedEnabled.value ? '，往来变动已同步' : ''}。`
+    const successText = isPartnerMode.value ? `已确认 ${actionCount || 1} 条往来流水${result?.balance_reconciliation ? '，余额盘点已记录' : ''}。` : isBalanceCheckDraft.value ? `${confirmationWarning ? `${confirmationWarning} ` : ''}已完成余额校准${transactionId ? `（流水 #${transactionId}）` : ''}。` : isTransferDraft.value ? `${confirmationWarning ? `${confirmationWarning} ` : ''}已确认账户转账/还款${transactionId ? `（流水 #${transactionId}）` : ''}。` : `${confirmationWarning ? `${confirmationWarning} ` : ''}已确认现金记账${transactionId ? `（流水 #${transactionId}）` : ''}${combinedEnabled.value ? '，往来变动已同步' : ''}。`
     notice.value = { type: confirmationWarning ? 'error' : 'success', message: successText }
-    await loadHistory(); resetConversation()
+    await Promise.all([loadHistory(), loadReferences()]); resetConversation()
   } catch (error) { confirmError.value = error instanceof ApiError ? error.message : '确认入账失败，请稍后重试。' }
   finally { confirming.value = false }
 }
@@ -1020,11 +1052,12 @@ onBeforeUnmount(() => clearInterval(thinkingTimer))
 </script>
 
 <style scoped>
+.calibration-compare{margin-top:0;margin-bottom:4px}.calibration-summary{display:flex;align-items:flex-start;gap:7px;margin:0 0 12px;padding:9px 11px;border-radius:8px;background:#fff8e7;color:#8a6924;font-size:12px;line-height:1.5}.calibration-summary.is-ready{background:#f0f7ff;color:#527098}.calibration-summary>span{display:grid;place-items:center;flex:0 0 18px;width:18px;height:18px;border-radius:50%;background:#dcecff;color:#2563eb;font-size:9px;font-weight:700}.batch-item .calibration-summary{margin-bottom:10px}
 .parsing-message .ai-thinking,.assistant-message .ai-thinking{margin-top:1px}
 .batch-item{margin-bottom:12px;padding:14px 16px 4px;border:1px solid #e1e9f4;border-radius:11px;background:#fbfcff}.batch-item.is-skipped{padding-bottom:14px;background:#f7f9fc;opacity:.72}.batch-item-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}.batch-item.is-skipped .batch-item-head{margin-bottom:0}.batch-item-check{display:inline-flex;align-items:center;gap:8px;color:#34435b;font-size:13px;cursor:pointer}.batch-item-check input{width:17px;height:17px;accent-color:#2563eb}.batch-item-summary{flex:1;min-width:0;color:#6b7a90;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.batch-item-missing{color:#8a6924;background:#fff4da;border-radius:99px;padding:4px 9px;font-size:11px;font-style:normal}.draft-direction.batch-type{grid-template-columns:repeat(3,1fr)}
 .request-error{display:grid;gap:4px;margin-top:11px;padding:11px 12px;border:1px solid #f1d0d0;border-radius:9px;background:#fff6f6;color:#a33f46;font-size:12px;line-height:1.5}.request-error strong{font-size:12px}.request-error span{color:#8c555b}.request-error small{color:#aa7378}.request-error a{width:max-content;margin-top:2px;color:#2563eb;text-decoration:none;font-weight:600}.request-error.is-backend_unreachable,.request-error.is-timeout{border-color:#f0d9af;background:#fff9ed;color:#88651f}.request-error.is-backend_unreachable span,.request-error.is-timeout span{color:#866d3d}
 .panel{background:#fff;border-radius:13px;box-shadow:0 2px 8px #243b5a0d}.primary{border:0;border-radius:8px;background:#2563eb;color:#fff;padding:10px 17px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}.primary:hover{background:#1d4ed8}.primary:disabled{opacity:.65;cursor:wait}.secondary-link{color:#2563eb;text-decoration:none;font-size:13px;font-weight:600;padding:10px 3px}.ai-chat-header{margin-top:28px;padding:24px;border:1px solid #e1eaf7;box-shadow:0 7px 24px #23436d12}.section-heading{display:flex;align-items:center;gap:12px}.ai-badge{width:38px;height:38px;border-radius:12px;background:#edf4ff;color:#2563eb;display:grid;place-items:center;font-size:19px}.section-heading h2,.panel-title h2{margin:0;color:#34435b;font-size:17px}.section-heading p,.panel-title p{margin:6px 0 0;color:#8a97aa;font-size:12px}.prompt-form{margin-top:18px}.prompt-form textarea{width:100%;min-height:44px;max-height:130px;resize:vertical;border:1px solid #dbe2ee;border-radius:12px;padding:11px 13px;color:#44536a;background:#fbfcff;font:inherit;font-size:14px;outline:0}.prompt-form textarea:focus{border-color:#3b82f6;box-shadow:0 0 0 3px #3b82f61c}.prompt-foot{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-top:11px;color:#98a4b4;font-size:11px}.chat-composer{position:sticky;bottom:14px;z-index:20;margin-top:18px;padding:12px 16px 14px;border:1px solid #d8e6f8;box-shadow:0 10px 28px #23436d1b}.chat-composer .prompt-form{margin-top:0}.chat-send{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border:0;border-radius:50%;background:#2563eb;color:#fff;font-size:23px;line-height:1;cursor:pointer;box-shadow:0 4px 10px #2563eb38}.chat-send:disabled{opacity:.45;cursor:wait;box-shadow:none}.chat-send .spinner{margin:0;width:16px;height:16px}.fallback-hint{margin-top:11px;background:#fff8e7;color:#8a6924;padding:10px 12px;border-radius:8px;font-size:12px}.fallback-hint a{color:#2563eb;margin-left:4px;text-decoration:none}.parse-result-meta{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:12px;padding-top:12px;border-top:1px solid #edf1f6}.parse-source-badge{display:inline-flex;align-items:center;gap:6px;padding:5px 8px;border-radius:99px;background:#edf5ff;color:#2563eb;font-size:10px;font-weight:600;white-space:nowrap}.parse-source-badge i{width:6px;height:6px;border-radius:50%;background:#2563eb}.parse-source-badge.is-fallback{background:#f1f3f6;color:#64748b}.parse-source-badge.is-fallback i{background:#94a3b8}.parse-warning-text{color:#8a6924;font-size:11px;line-height:1.45}.conversation,.confirm-card,.history{margin-top:18px;overflow:hidden}.panel-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:20px 24px;border-bottom:1px solid #edf0f5}.text-button{border:0;background:transparent;color:#2563eb;font-size:12px;cursor:pointer;padding:4px}.messages{padding:18px 24px 21px;display:grid;gap:12px}.message{display:flex;gap:9px;align-items:flex-start;max-width:85%}.message-avatar{width:27px;height:27px;flex:0 0 27px;border-radius:9px;display:grid;place-items:center;font-size:11px;font-weight:600}.assistant-message .message-avatar{color:#2563eb;background:#edf4ff}.user-message{margin-left:auto;flex-direction:row-reverse;scroll-margin-top:20px}.user-message .message-avatar{color:#52617a;background:#eef2f8}.message p{margin:0;border-radius:11px;padding:10px 12px;color:#53627a;background:#f6f8fb;font-size:13px;line-height:1.6}.user-message p{color:#fff;background:#2563eb}.parsing-message p{display:inline-flex;align-items:center;gap:8px;color:#7e8da4}.typing-dots{display:inline-flex;gap:3px;align-items:center}.typing-dots i{width:5px;height:5px;border-radius:50%;background:#8ba5ce;animation:typing-dot 1.1s infinite ease-in-out}.typing-dots i:nth-child(2){animation-delay:.15s}.typing-dots i:nth-child(3){animation-delay:.3s}@keyframes typing-dot{0%,60%,100%{opacity:.35;transform:translateY(0)}30%{opacity:1;transform:translateY(-2px)}}.confirm-card{padding-bottom:22px}.draft-status{color:#8a6924;background:#fff4da;border-radius:99px;padding:5px 8px;font-size:11px}.warning{margin:16px 24px 0;border-radius:8px;padding:10px 12px;background:#fff8e7;color:#8a6924;font-size:12px}.draft-form{padding:18px 24px 0}.draft-direction{display:grid;grid-template-columns:1fr 1fr;gap:5px;padding:4px;background:#f1f5fb;border-radius:10px}.draft-direction button{border:0;border-radius:7px;padding:9px;background:transparent;color:#7c8ba1;cursor:pointer;font-size:13px}.draft-direction button.selected{background:#fff;color:#2563eb;box-shadow:0 1px 5px #263b6114;font-weight:600}.draft-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}.draft-grid label{display:block;color:#59677d;font-size:13px;margin:14px 0}.draft-grid input,.draft-grid select,.draft-grid textarea{display:block;width:100%;margin-top:6px;border:1px solid #dbe2ee;border-radius:8px;padding:10px;color:#44536a;background:#fff;font:inherit;font-size:13px;outline:0}.draft-grid input:focus,.draft-grid select,.draft-grid textarea:focus{border-color:#3b82f6}.partner-ledger-confirm{margin-top:13px;border:1px solid #dbe6f5;border-radius:9px;background:#f8fbff;padding:12px}.ledger-toggle{display:flex;align-items:center;gap:8px;color:#42536c;font-size:13px;font-weight:600}.ledger-toggle input{accent-color:#2563eb}.ledger-hint{margin:8px 0 0;color:#9a6d26;font-size:12px}.ledger-fields{display:flex;align-items:center;gap:12px;margin-top:10px}.ledger-fields label{color:#59677d;font-size:12px;flex:0 1 220px}.ledger-fields select{display:block;width:100%;margin-top:5px;border:1px solid #dbe2ee;border-radius:8px;padding:8px;color:#44536a;background:#fff;font:inherit;font-size:12px}.ledger-preview{color:#53627a;font-size:12px;white-space:nowrap}.confirm-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:8px}.outline-button{border:1px solid #d6dfec;border-radius:8px;background:#fff;color:#52617a;padding:9px 15px;cursor:pointer;font-size:13px}.form-error{margin-top:13px;color:#a83232;background:#fff0f0;border-radius:8px;padding:10px 12px;font-size:13px}.history-state{min-height:130px;display:grid;place-content:center;justify-items:center;text-align:center;color:#8b98aa;padding:20px}.history-state p{margin:7px 0;font-size:13px}.error-state{color:#ba4b53}.history-list{list-style:none;padding:0 24px;margin:0}.history-list li{display:flex;align-items:flex-start;gap:11px;padding:15px 0;border-bottom:1px solid #edf0f5}.history-list li:last-child{border-bottom:0}.history-icon{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;color:#2563eb;background:#edf4ff;font-size:14px}.history-content{min-width:0;flex:1}.history-content strong{display:block;color:#53627a;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.history-content span{display:block;color:#a0aaba;font-size:10px;margin-top:4px}.history-content p{margin:6px 0 0;color:#7d8ba0;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.history-status{border-radius:99px;padding:4px 7px;font-size:10px;white-space:nowrap}.history-ok{color:#12845e;background:#e7f8f0}.history-error{color:#c84d54;background:#fff0f0}.spinner{width:16px;height:16px;border:2px solid #ffffff66;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;display:inline-block;vertical-align:-3px;margin-right:5px}.spinner.dark{border-color:#dce7f8;border-top-color:#2563eb;margin:0 0 5px}@keyframes spin{to{transform:rotate(360deg)}}
-@media(max-width:620px){.ai-chat-header{margin-top:20px;padding:18px 16px}.prompt-foot{align-items:flex-end;flex-direction:row}.prompt-foot .chat-send{width:42px}.panel-title{padding:17px 16px}.messages,.draft-form{padding-left:16px;padding-right:16px}.message{max-width:95%}.draft-grid{grid-template-columns:1fr}.ledger-fields{align-items:stretch;flex-direction:column;gap:5px}.ledger-preview{white-space:normal}.history-list{padding:0 16px}.history-content p{white-space:normal}.secondary-link{font-size:11px}.chat-composer{bottom:8px;margin-left:0;margin-right:0;padding:10px 12px 11px}.chat-composer .prompt-form textarea{min-height:42px}.chat-composer .quick-prompts{overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none}.chat-composer .quick-prompts::-webkit-scrollbar{display:none}.chat-composer .quick-prompts button{white-space:nowrap}}
+@media(max-width:620px){.ai-chat-header{margin-top:20px;padding:18px 16px}.prompt-foot{align-items:flex-end;flex-direction:row}.prompt-foot .chat-send{width:42px}.panel-title{padding:17px 16px}.messages,.draft-form{padding-left:16px;padding-right:16px}.message{max-width:95%}.draft-grid{grid-template-columns:1fr}.ledger-fields{align-items:stretch;flex-direction:column;gap:5px}.ledger-preview{white-space:normal}.history-list{padding:0 16px}.history-content p{white-space:normal}.secondary-link{font-size:11px}.chat-composer{bottom:8px;margin-left:0;margin-right:0;padding:10px 12px 11px}.chat-composer .prompt-form textarea{min-height:42px}.chat-composer .quick-prompts{overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none}.chat-composer .quick-prompts::-webkit-scrollbar{display:none}.chat-composer .quick-prompt{white-space:nowrap}}
 .message-bubble{min-width:0;display:grid;gap:6px}.chat-message .message-bubble p{white-space:pre-wrap}.assistant-message.chat-message{max-width:92%}.message-link{width:max-content;max-width:100%;color:#2563eb;font-size:12px;font-weight:600;text-decoration:none}
 .reconciliation-toggle{display:flex;align-items:center;gap:8px;margin:12px 0 0;padding:10px 11px;border:1px solid #dbe6f5;border-radius:8px;background:#f8fbff;color:#596b84;font-size:12px;line-height:1.45}.reconciliation-toggle input{accent-color:#2563eb}.transfer-hint{margin:0 0 12px;padding:10px 11px;border:1px solid #dbe6f5;border-radius:8px;background:#f8fbff;color:#596b84;font-size:12px;line-height:1.5}
 @media(max-width:620px){
@@ -1074,8 +1107,8 @@ onBeforeUnmount(() => clearInterval(thinkingTimer))
   .message{gap:7px}
   .message-avatar{width:25px;height:25px;flex-basis:25px}
 }
-.ai-header-actions{display:flex;align-items:center;justify-content:flex-end;gap:12px;flex-wrap:wrap}.ai-header-mode{display:inline-flex;align-items:center;gap:5px;color:#2563eb;background:#edf4ff;border:1px solid #dce9ff;border-radius:99px;padding:7px 10px;font-size:11px;font-weight:600;white-space:nowrap}.ai-header-mode span{font-size:14px;line-height:1}.ai-compose{border:1px solid #e1eaf7;box-shadow:0 7px 24px #23436d12}.compose-modebar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:-24px -24px 21px;padding:12px 24px;border-bottom:1px solid #e8eef7;background:linear-gradient(90deg,#f7faff,#fff)}.compose-mode-current{display:flex;align-items:center;gap:9px;min-width:0}.compose-mode-icon{display:grid;place-items:center;width:26px;height:26px;border-radius:8px;background:#eaf2ff;color:#2563eb;font-size:14px}.compose-mode-current strong{display:block;color:#33435b;font-size:12px}.compose-mode-current div>span{display:block;margin-top:2px;color:#8b98aa;font-size:10px}.manual-switch{display:inline-flex;align-items:center;gap:5px;color:#64748b;text-decoration:none;border:1px solid #dbe3ef;border-radius:8px;padding:8px 11px;font-size:11px;white-space:nowrap;transition:border-color .15s,color .15s,background .15s}.manual-switch:hover{border-color:#9dbcf1;color:#2563eb;background:#f7faff}.manual-switch span{font-size:14px;line-height:1}.ai-flow{display:flex;align-items:center;gap:8px;margin:18px 0 0;color:#a0aaba;font-size:11px}.ai-flow i{font-style:normal;color:#c1cada}.ai-flow-step{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}.ai-flow-step b{display:grid;place-items:center;width:20px;height:20px;border-radius:50%;background:#eef2f8;color:#7d8ba0;font-size:10px}.ai-flow-step.is-active{color:#2563eb;font-weight:600}.ai-flow-step.is-active b{background:#2563eb;color:#fff}.quick-prompts{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:10px}.quick-prompts>span{color:#99a5b5;font-size:11px;margin-right:2px}.quick-prompts button{border:1px solid #dce5f1;border-radius:99px;background:#fff;color:#62738c;padding:6px 10px;font-size:11px;cursor:pointer;transition:border-color .15s,color .15s,background .15s}.quick-prompts button:hover{border-color:#a8c4f2;color:#2563eb;background:#f7faff}.quick-prompts button:disabled{opacity:.55;cursor:wait}.draft-progress{margin:14px 24px 0;padding:9px 11px;border-radius:8px;color:#8a6924;background:#fff8e7;font-size:12px;line-height:1.45}.draft-progress.ready{color:#12845e;background:#e7f8f0}.ai-brief-comment{display:grid;grid-template-columns:30px minmax(0,1fr);gap:10px;margin:12px 24px 0;padding:12px 13px;border:1px solid #dbe8fb;border-radius:11px;background:linear-gradient(145deg,#f7faff,#fff)}.ai-brief-comment>span{display:grid;place-items:center;width:30px;height:30px;border-radius:9px;background:#e8f1ff;color:#2563eb;font-size:14px}.ai-brief-comment strong{display:block;color:#41536d;font-size:11px}.ai-brief-comment p{margin:4px 0 0;color:#61728a;font-size:12px;line-height:1.55;overflow-wrap:anywhere}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-@media(max-width:760px){.ai-header-actions{gap:7px}.ai-header-mode{padding:6px 8px}.compose-modebar{align-items:flex-start;flex-direction:column;gap:9px;margin:-18px -16px 17px;padding:11px 16px}.manual-switch{min-height:40px}.ai-flow{gap:5px;justify-content:space-between;font-size:10px}.ai-flow i{font-size:10px}.quick-prompts{gap:6px}.quick-prompts button{min-height:36px}.draft-progress,.ai-brief-comment{margin-left:16px;margin-right:16px}}
+.ai-header-actions{display:flex;align-items:center;justify-content:flex-end;gap:12px;flex-wrap:wrap}.ai-header-mode{display:inline-flex;align-items:center;gap:5px;color:#2563eb;background:#edf4ff;border:1px solid #dce9ff;border-radius:99px;padding:7px 10px;font-size:11px;font-weight:600;white-space:nowrap}.ai-header-mode span{font-size:14px;line-height:1}.ai-compose{border:1px solid #e1eaf7;box-shadow:0 7px 24px #23436d12}.compose-modebar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:-24px -24px 21px;padding:12px 24px;border-bottom:1px solid #e8eef7;background:linear-gradient(90deg,#f7faff,#fff)}.compose-mode-current{display:flex;align-items:center;gap:9px;min-width:0}.compose-mode-icon{display:grid;place-items:center;width:26px;height:26px;border-radius:8px;background:#eaf2ff;color:#2563eb;font-size:14px}.compose-mode-current strong{display:block;color:#33435b;font-size:12px}.compose-mode-current div>span{display:block;margin-top:2px;color:#8b98aa;font-size:10px}.manual-switch{display:inline-flex;align-items:center;gap:5px;color:#64748b;text-decoration:none;border:1px solid #dbe3ef;border-radius:8px;padding:8px 11px;font-size:11px;white-space:nowrap;transition:border-color .15s,color .15s,background .15s}.manual-switch:hover{border-color:#9dbcf1;color:#2563eb;background:#f7faff}.manual-switch span{font-size:14px;line-height:1}.ai-flow{display:flex;align-items:center;gap:8px;margin:18px 0 0;color:#a0aaba;font-size:11px}.ai-flow i{font-style:normal;color:#c1cada}.ai-flow-step{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}.ai-flow-step b{display:grid;place-items:center;width:20px;height:20px;border-radius:50%;background:#eef2f8;color:#7d8ba0;font-size:10px}.ai-flow-step.is-active{color:#2563eb;font-weight:600}.ai-flow-step.is-active b{background:#2563eb;color:#fff}.quick-prompts{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:10px}.quick-prompts>span{color:#99a5b5;font-size:11px;margin-right:2px}.quick-prompt{border:1px solid #e6edf6;border-radius:99px;background:#f9fbfe;color:#7a8a9f;padding:6px 10px;font-size:11px;white-space:nowrap;user-select:text}.draft-progress{margin:14px 24px 0;padding:9px 11px;border-radius:8px;color:#8a6924;background:#fff8e7;font-size:12px;line-height:1.45}.draft-progress.ready{color:#12845e;background:#e7f8f0}.ai-brief-comment{display:grid;grid-template-columns:30px minmax(0,1fr);gap:10px;margin:12px 24px 0;padding:12px 13px;border:1px solid #dbe8fb;border-radius:11px;background:linear-gradient(145deg,#f7faff,#fff)}.ai-brief-comment>span{display:grid;place-items:center;width:30px;height:30px;border-radius:9px;background:#e8f1ff;color:#2563eb;font-size:14px}.ai-brief-comment strong{display:block;color:#41536d;font-size:11px}.ai-brief-comment p{margin:4px 0 0;color:#61728a;font-size:12px;line-height:1.55;overflow-wrap:anywhere}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media(max-width:760px){.ai-header-actions{gap:7px}.ai-header-mode{padding:6px 8px}.compose-modebar{align-items:flex-start;flex-direction:column;gap:9px;margin:-18px -16px 17px;padding:11px 16px}.manual-switch{min-height:40px}.ai-flow{gap:5px;justify-content:space-between;font-size:10px}.ai-flow i{font-size:10px}.quick-prompts{gap:6px}.draft-progress,.ai-brief-comment{margin-left:16px;margin-right:16px}}
 .partner-confirm-card{position:relative;border:1px solid #dce7f6;box-shadow:0 10px 30px #213b6114;}
 .partner-confirm-card:before{content:"";position:absolute;inset:0 0 auto;height:3px;background:linear-gradient(90deg,#2563eb,#60a5fa 58%,#d9e7fa);z-index:2;}
 .partner-confirm-card>.panel-title{background:linear-gradient(145deg,#fff 0%,#f7faff 100%);}

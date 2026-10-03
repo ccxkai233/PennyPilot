@@ -5,14 +5,14 @@
       <button v-if="!isMobile" class="outline-button manual-button" type="button" @click="openCreate">手动记账</button>
     </template>
 
-    <MobileTransactions v-if="isMobile" :transactions="transactions" :summary="summary" :categories="categories" :visible-categories="visibleCategories" :form-categories="formCategories" :payment-methods="paymentMethods" :form-payment-methods="formPaymentMethods" :partners="partners" :filters="filters" :form="form" :loading="loading" :saving="saving" :error-message="errorMessage" :form-error="formError" :modal-open="modalOpen" :editing="editing" :category-name="categoryName" :payment-method-name="paymentMethodName" :payment-method-option-label="paymentMethodOptionLabel" :transaction-cents="transactionCents" :is-voided="isVoided" :load-transactions="loadTransactions" :reset-filters="resetFilters" :open-create="openCreate" :open-edit="openEdit" :close-modal="closeModal" :save-transaction="saveTransaction" :void-transaction="voidTransaction" />
+    <MobileTransactions v-if="isMobile" :ask="ask" :ask-scope-label="askScopeLabel" :report-question="reportQuestion" :ask-ledger="askLedger" :clear-ask="clearAsk" :proposal-label="proposalLabel" :describe-snapshot="describeSnapshot" :apply-proposal="applyProposal" :ignore-proposal="ignoreProposal" :load-conversation="loadConversation" :toggle-history="toggleHistory" :new-conversation="newConversation" :delete-conversation="deleteConversation" :transactions="transactions" :summary="summary" :categories="categories" :visible-categories="visibleCategories" :form-categories="formCategories" :payment-methods="paymentMethods" :form-payment-methods="formPaymentMethods" :partners="partners" :filters="filters" :form="form" :loading="loading" :saving="saving" :error-message="errorMessage" :form-error="formError" :modal-open="modalOpen" :editing="editing" :category-name="categoryName" :payment-method-name="paymentMethodName" :payment-method-option-label="paymentMethodOptionLabel" :transaction-cents="transactionCents" :is-voided="isVoided" :load-transactions="loadTransactions" :reset-filters="resetFilters" :open-create="openCreate" :open-edit="openEdit" :close-modal="closeModal" :save-transaction="saveTransaction" :void-transaction="voidTransaction" />
     <template v-else>
 
     <section class="filters panel" aria-label="流水筛选">
       <div class="filter-row">
         <label class="filter-field"><span>类型</span><select v-model="filters.direction" @change="loadTransactions"><option value="">全部类型</option><option value="income">收入</option><option value="expense">支出</option><option value="transfer">转账/还款</option></select></label>
-        <label class="filter-field"><span>开始日期</span><input v-model="filters.from" type="date" @change="loadTransactions" /></label>
-        <label class="filter-field"><span>结束日期</span><input v-model="filters.to" type="date" @change="loadTransactions" /></label>
+        <div class="filter-field date-field"><span>开始日期</span><DateSegmentInput :model-value="filters.from" edge="start" label="开始日期" apply-on="enter" @update:model-value="setDateFilter('from', $event)" /></div>
+        <div class="filter-field date-field"><span>结束日期</span><DateSegmentInput :model-value="filters.to" edge="end" label="结束日期" placeholder="如 20261031 / 202610" apply-on="enter" @update:model-value="setDateFilter('to', $event)" /></div>
         <label class="filter-field"><span>分类</span><select v-model="filters.category_id" @change="loadTransactions"><option value="">全部分类</option><option v-for="category in visibleCategories" :key="category.id" :value="category.id">{{ category.name }}</option></select></label>
         <label class="filter-field"><span>资金账户</span><select v-model="filters.payment_method_id" @change="loadTransactions"><option value="">全部账户</option><option v-for="method in paymentMethods" :key="method.id" :value="method.id">{{ paymentMethodOptionLabel(method) }}</option></select></label>
         <label class="filter-field"><span>往来账户</span><select v-model="filters.partner_id" @change="loadTransactions"><option value="">全部账户</option><option v-for="partner in partners" :key="partner.id" :value="partner.id">{{ partner.name }}</option></select></label>
@@ -80,6 +80,46 @@
         </section>
       </div>
     </Teleport>
+
+    <section v-if="ask.messages.length || ask.loading" ref="askThread" class="ask-panel panel" aria-label="AI 问答">
+      <div class="panel-title"><div><h2>问账</h2><p>AI 自行决定查询范围，可以接着追问；改账方案需要你确认后才执行</p></div><button class="text-button" type="button" @click="newConversation">新对话</button></div>
+      <div v-if="ask.messages.length || ask.loading" class="ask-thread" aria-live="polite">
+        <div v-for="(message, index) in ask.messages" :key="index" class="ask-message" :class="message.role === 'user' ? 'is-user' : 'is-assistant'">
+          <ul v-if="message.steps && message.steps.length" class="ask-steps"><li v-for="(step, stepIndex) in message.steps" :key="stepIndex">{{ step.summary }}<em v-if="step.result"> → {{ step.result }}</em></li></ul>
+          <p>{{ message.content }}</p>
+          <div v-for="proposal in (message.proposals || [])" :key="proposal.index" class="ask-proposal" :class="`is-${proposal.status}`">
+            <div class="ask-proposal-head"><strong>{{ proposalLabel(proposal) }}<span v-if="proposal.transaction_id"> #{{ proposal.transaction_id }}</span></strong><span class="ask-proposal-status">{{ ({ pending: '待确认', applied: '已执行', ignored: '已忽略', failed: '执行失败' })[proposal.status] || proposal.status }}</span></div>
+            <p v-if="proposal.before" class="ask-proposal-line"><span>原记录</span>{{ describeSnapshot(proposal.before) }}</p>
+            <p v-if="proposal.after" class="ask-proposal-line"><span>{{ proposal.type === 'create' ? '补记为' : '改为' }}</span>{{ describeSnapshot(proposal.after) }}</p>
+            <p v-if="proposal.reason" class="ask-proposal-line"><span>原因</span>{{ proposal.reason }}</p>
+            <p v-if="proposal.detail" class="ask-proposal-line is-error"><span>说明</span>{{ proposal.detail }}</p>
+            <div v-if="proposal.status === 'pending'" class="ask-proposal-actions"><button class="primary" type="button" :disabled="proposal.busy" @click="applyProposal(message, proposal)">{{ proposal.busy ? '执行中…' : '确认执行' }}</button><button class="outline-button" type="button" :disabled="proposal.busy" @click="ignoreProposal(message, proposal)">忽略</button></div>
+          </div>
+          <small v-if="message.role === 'assistant' && (message.period || message.warning)">{{ [message.period, message.warning].filter(Boolean).join(' · ') }}<router-link v-if="message.report_id" :to="{ path: '/reports', query: { report: message.report_id } }"> 报告已保存，在财务分析中查看 →</router-link></small>
+        </div>
+        <div v-if="ask.loading" class="ask-message is-assistant is-live" aria-live="polite">
+          <ul v-if="ask.steps.length" class="ask-steps"><li v-for="(step, stepIndex) in ask.steps" :key="stepIndex">{{ step.summary }}<em v-if="step.result"> → {{ step.result }}</em></li></ul>
+          <p><span class="spinner dark"></span>{{ ask.stage || '正在思考…' }}</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="ask-composer panel" aria-label="向 AI 查账">
+      <form class="ask-form" @submit.prevent="askLedger(ask.text)">
+        <label class="sr-only" for="ask-ledger-input">查账问题</label>
+        <textarea id="ask-ledger-input" v-model="ask.text" rows="1" maxlength="1000" :disabled="ask.loading" placeholder="问问账本：花了多少？哪类最多？和上月比呢？" @keydown.enter.exact.prevent="askLedger(ask.text)" @input="autoGrow($event.target)"></textarea>
+        <button class="outline-button" type="button" :disabled="ask.loading" :title="reportQuestion" @click="askLedger(reportQuestion, 'report')">生成报告</button>
+        <button class="chat-send" type="submit" :disabled="ask.loading || !ask.text" :aria-label="ask.loading ? '思考中' : '提问'" :title="ask.loading ? '思考中' : '提问'"><span v-if="ask.loading" class="spinner"></span><span v-else aria-hidden="true">↑</span></button>
+      </form>
+      <p class="ask-scope"><span v-if="ask.error" class="ask-inline-error" role="alert">{{ ask.error }}</span><span v-else>“生成报告”按当前筛选（{{ askScopeLabel }}）生成 · Enter 发送 · Shift + Enter 换行</span><span class="ask-scope-actions"><button type="button" class="text-button" @click="toggleHistory">{{ ask.historyOpen ? '收起历史' : '历史对话' }}</button><button v-if="ask.messages.length" type="button" class="text-button" @click="newConversation">新对话</button></span></p>
+      <div v-if="ask.historyOpen" class="ask-history" aria-label="历史对话">
+        <p v-if="ask.historyLoading" class="ask-history-empty">正在加载…</p>
+        <p v-else-if="!ask.history.length" class="ask-history-empty">还没有历史对话。</p>
+        <ul v-else>
+          <li v-for="item in ask.history" :key="item.id" :class="{ 'is-current': item.id === ask.conversationId }"><button type="button" class="ask-history-item" @click="loadConversation(item.id)"><strong>{{ item.title }}</strong><small>{{ formatDateTime(item.updated_at) }} · {{ Math.floor(item.message_count / 2) }} 轮</small></button><button type="button" class="text-button danger-text" @click="deleteConversation(item.id)">删除</button></li>
+        </ul>
+      </div>
+    </section>
     </template>
     <ConfirmDialog
       :open="confirmDialog.open"
@@ -95,14 +135,16 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import AppLayout from '../components/AppLayout.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import { useViewport } from '../composables/useViewport'
 import { useConfirmDialog } from '../composables/useConfirmDialog'
 import MobileTransactions from './MobileTransactions.vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ApiError, amountToCents, datetimeLocalToUtcIso, formatDateTime, formatMoney, localDateTimeValue, categoriesApi, partnersApi, paymentMethodsApi, transactionsApi } from '../api'
+import { aiApi, amountToCents, ApiError, beijingDateIso, categoriesApi, datetimeLocalToUtcIso, formatDateTime, formatMoney, localDateTimeValue, partnersApi, paymentMethodsApi, transactionsApi, utcNowIso } from '../api'
+import { currentMonthRange } from '../dateInput'
+import DateSegmentInput from '../components/DateSegmentInput.vue'
 
 const transactions = ref([])
 const categories = ref([])
@@ -117,7 +159,14 @@ const editing = ref(null)
 const notice = ref(null)
 const route = useRoute()
 const router = useRouter()
-const filters = reactive({ direction: '', from: '', to: '', category_id: '', payment_method_id: '', partner_id: String(route.query.partner_id || '') })
+// The list opens on the current month; dates accept loose input (20261001,
+// 202610, 10-1…) and are normalized to YYYY-MM-DD.
+const filters = reactive({ direction: '', ...currentMonthRange(), category_id: '', payment_method_id: '', partner_id: String(route.query.partner_id || '') })
+function setDateFilter(key, value) {
+  if (filters[key] === value) return
+  filters[key] = value
+  loadTransactions()
+}
 const form = reactive({ kind: 'cashflow', direction: 'expense', amount: '', occurred_at: localDateTimeValue(), category_id: '', payment_method_id: '', transfer_payment_method_id: '', partner_id: '', notes: '' })
 const { isMobile } = useViewport()
 const { confirmDialog, requestConfirm, resolveConfirm } = useConfirmDialog()
@@ -132,6 +181,125 @@ function setFormType(type) {
   form.kind = 'cashflow'; form.direction = type; form.transfer_payment_method_id = ''
 }
 const subtitle = computed(() => `共 ${transactions.value.length} 笔记录`)
+
+// Questions about the list are answered from aggregated figures within the
+// current filters; the AI page only does bookkeeping.
+const ask = reactive({ text: '', loading: false, error: '', messages: [], steps: [], stage: '', conversationId: null, history: [], historyOpen: false, historyLoading: false })
+const CONVERSATION_KEY = 'pennypilot:ask-conversation'
+function proposalLabel(proposal) {
+  return ({ update: '修改流水', void: '作废流水', create: '补记一笔' })[proposal?.type] || '修改方案'
+}
+function describeSnapshot(snapshot) {
+  if (!snapshot) return ''
+  const amount = Number.isInteger(snapshot.amount_cents) ? formatMoney(snapshot.amount_cents) : ''
+  const kind = snapshot.kind === 'transfer' ? `转账 ${snapshot.account || ''} → ${snapshot.to_account || ''}` : `${snapshot.direction === 'income' ? '收入' : '支出'} ${snapshot.account || ''}`
+  return [snapshot.occurred_at, kind, amount, snapshot.category, snapshot.partner ? `往来 ${snapshot.partner}` : '', snapshot.notes].filter(Boolean).join(' · ')
+}
+async function loadConversation(id) {
+  if (!id) return
+  try {
+    const payload = await aiApi.conversation(id)
+    ask.conversationId = payload.id
+    ask.messages = (payload.messages || []).map((item) => ({ id: item.id, role: item.role, content: item.content, steps: item.steps || [], proposals: item.proposals || [], period: item.period || '', warning: item.warning || '', report_id: item.report_id || null }))
+    localStorage.setItem(CONVERSATION_KEY, String(payload.id))
+    ask.historyOpen = false
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) { ask.conversationId = null; localStorage.removeItem(CONVERSATION_KEY) }
+  }
+}
+async function loadHistory() {
+  ask.historyLoading = true
+  try { ask.history = await aiApi.conversations(30) } catch { ask.history = [] } finally { ask.historyLoading = false }
+}
+async function toggleHistory() { ask.historyOpen = !ask.historyOpen; if (ask.historyOpen) await loadHistory() }
+function newConversation() { ask.conversationId = null; ask.messages = []; ask.error = ''; ask.steps = []; ask.historyOpen = false; localStorage.removeItem(CONVERSATION_KEY) }
+async function deleteConversation(id) {
+  if (!await requestConfirm({ eyebrow: 'AI 问答', title: '删除这个对话？', message: '对话记录和其中的修改方案状态会一起删除。', confirmLabel: '删除', tone: 'danger' })) return
+  try { await aiApi.deleteConversation(id); ask.history = ask.history.filter((item) => item.id !== id); if (ask.conversationId === id) newConversation() } catch (error) { ask.error = error instanceof ApiError ? error.message : '删除失败。' }
+}
+async function applyProposal(message, proposal) {
+  if (!proposal || proposal.status !== 'pending') return
+  proposal.busy = true
+  try {
+    if (proposal.type === 'update') await transactionsApi.update(proposal.transaction_id, proposal.changes)
+    else if (proposal.type === 'void') await transactionsApi.voidTransaction(proposal.transaction_id, proposal.reason || null)
+    else if (proposal.type === 'create') await transactionsApi.create(proposal.draft)
+    proposal.status = 'applied'
+    notice.value = { type: 'success', message: `${proposalLabel(proposal)}已执行。` }
+    await Promise.all([loadTransactions(), loadDictionaries()])
+  } catch (error) {
+    proposal.status = 'failed'; proposal.detail = error instanceof ApiError ? error.message : '执行失败。'
+  } finally {
+    proposal.busy = false
+    if (ask.conversationId && message.id) aiApi.setProposalStatus(ask.conversationId, message.id, proposal.index, proposal.status, proposal.detail || null).catch(() => {})
+  }
+}
+function ignoreProposal(message, proposal) {
+  if (!proposal || proposal.status !== 'pending') return
+  proposal.status = 'ignored'
+  if (ask.conversationId && message.id) aiApi.setProposalStatus(ask.conversationId, message.id, proposal.index, 'ignored').catch(() => {})
+}
+const ASK_STATUS = { provider_failed: '该通道没有响应，切换到备用通道', local_fallback: 'AI 通道不可用，改用本地汇总回答' }
+function handleAskEvent(event) {
+  const type = String(event?.type || '')
+  if (type === 'provider') ask.stage = `${event.name === 'fallback' ? '备用通道' : '主通道'}${event.model ? ` ${event.model}` : ''} 正在思考…`
+  else if (type === 'tool') { ask.steps.push({ summary: event.summary, result: '' }); ask.stage = `查询：${event.summary}` }
+  else if (type === 'tool_result') { const step = ask.steps[ask.steps.length - 1]; if (step) step.result = event.summary }
+  else if (type === 'status' && ASK_STATUS[event.code]) ask.steps.push({ summary: ASK_STATUS[event.code], result: '' })
+}
+const askScopeLabel = computed(() => {
+  const parts = []
+  if (filters.from || filters.to) parts.push(`${filters.from || '最早'} 至 ${filters.to || '今天'}`)
+  else parts.push('本月')
+  if (filters.payment_method_id) parts.push(paymentMethods.value.find((item) => String(item.id) === String(filters.payment_method_id))?.name || '所选账户')
+  if (filters.category_id) parts.push(categories.value.find((item) => String(item.id) === String(filters.category_id))?.name || '所选分类')
+  if (filters.partner_id) parts.push(partners.value.find((item) => String(item.id) === String(filters.partner_id))?.name || '所选往来单位')
+  if (filters.direction === 'income' || filters.direction === 'expense') parts.push(filters.direction === 'income' ? '仅收入' : '仅支出')
+  return parts.join(' · ')
+})
+// The "report" button turns the current filters into an explicit question;
+// everything else is just the user's words, the assistant picks the range.
+const reportQuestion = computed(() => {
+  const range = filters.from || filters.to ? `${filters.from || '最早记录'} 至 ${filters.to || beijingDateIso()}` : '本月'
+  const limits = []
+  if (filters.payment_method_id) limits.push(`只看 ${paymentMethods.value.find((item) => String(item.id) === String(filters.payment_method_id))?.name || '所选'} 账户`)
+  if (filters.category_id) limits.push(`只看 ${categories.value.find((item) => String(item.id) === String(filters.category_id))?.name || '所选'} 分类`)
+  if (filters.partner_id) limits.push(`只看与 ${partners.value.find((item) => String(item.id) === String(filters.partner_id))?.name || '所选往来单位'} 相关的流水`)
+  if (filters.direction === 'income' || filters.direction === 'expense') limits.push(filters.direction === 'income' ? '只看收入' : '只看支出')
+  return `生成 ${range} 的收支报告${limits.length ? `，${limits.join('，')}` : ''}`
+})
+async function askLedger(text, intent = 'query') {
+  const question = String(text || '').trim()
+  if (!question || ask.loading) return
+  ask.error = ''; ask.loading = true; ask.steps = []; ask.stage = '正在连接 AI…'
+  ask.messages.push({ role: 'user', content: question })
+  if (intent === 'query') { ask.text = ''; nextTick(() => ['ask-ledger-input', 'mobile-ask-input'].forEach((id) => autoGrow(document.getElementById(id)))) }
+  try {
+    const conversation = ask.conversationId ? [] : ask.messages.slice(0, -1).slice(-8).map(({ role, content }) => ({ role, content }))
+    const payload = await aiApi.askStream({ text: question, intent, conversation, reference_time: utcNowIso(), conversation_id: ask.conversationId || undefined }, { onEvent: handleAskEvent })
+    const period = intent === 'report' && payload?.period?.label ? payload.period.label : ''
+    if (payload?.conversation_id) { ask.conversationId = payload.conversation_id; localStorage.setItem(CONVERSATION_KEY, String(payload.conversation_id)) }
+    ask.messages.push({ id: payload?.message_id || null, role: 'assistant', content: String(payload?.reply || '').trim() || '没有得到回答。', period, warning: payload?.warning || '', report_id: payload?.report_id || null, steps: ask.steps.map((step) => ({ ...step })), proposals: (payload?.proposals || []).map((item) => ({ ...item })) })
+    if (payload?.report_id) notice.value = { type: 'success', message: `${payload?.period?.label || '该周期'}收支报告已生成并保存到财务分析。` }
+  } catch (error) {
+    ask.messages.pop()
+    ask.error = error instanceof ApiError ? error.message : '提问失败，请稍后重试。'
+  } finally { ask.loading = false; ask.steps = []; ask.stage = '' }
+}
+function clearAsk() { newConversation() }
+// The question box grows with its content up to a few lines.
+function autoGrow(element) {
+  if (!element) return
+  element.style.height = 'auto'
+  element.style.height = `${Math.min(element.scrollHeight, 132)}px`
+}
+const askThread = ref(null)
+watch(() => ask.messages.length + (ask.loading ? 1 : 0), () => {
+  nextTick(() => {
+    const items = askThread.value?.querySelectorAll('.ask-message')
+    items?.[items.length - 1]?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  })
+})
 const summary = computed(() => {
   const cashflow = transactions.value.filter((item) => !isTransfer(item))
   const income = cashflow.reduce((sum, item) => item.direction === 'income' && !isVoided(item) ? sum + transactionCents(item) : sum, 0)
@@ -193,7 +361,7 @@ function paymentMethodName(transaction) {
   return `${source} → ${target}`
 }
 
-function resetFilters() { Object.assign(filters, { direction: '', from: '', to: '', category_id: '', payment_method_id: '', partner_id: '' }); loadTransactions() }
+function resetFilters() { Object.assign(filters, { direction: '', ...currentMonthRange(), category_id: '', payment_method_id: '', partner_id: '' }); loadTransactions() }
 function openCreate() { editing.value = null; formError.value = ''; normalizeForm(); modalOpen.value = true }
 function openEdit(transaction) {
   editing.value = transaction; formError.value = ''; normalizeForm(transaction); modalOpen.value = true
@@ -249,6 +417,7 @@ async function voidTransaction(transaction) {
   } catch (error) { notice.value = { type: 'error', message: error instanceof ApiError ? error.message : '作废失败。' } }
 }
 
+onMounted(() => { loadConversation(Number(localStorage.getItem(CONVERSATION_KEY)) || null) })
 onMounted(async () => {
   try { await loadDictionaries() } catch (error) { errorMessage.value = error instanceof ApiError ? error.message : '基础数据加载失败。' }
   await loadTransactions()
@@ -257,8 +426,9 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+.ask-panel { margin-top: 14px; padding-bottom: 14px; }.ask-panel .panel-title { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 16px 18px 12px; border-bottom: 1px solid #edf1f6; }.ask-panel .panel-title h2 { margin: 0; color: #34435b; font-size: 15px; }.ask-panel .panel-title p { margin: 4px 0 0; color: #8a97aa; font-size: 12px; }.ask-panel .panel-title .text-button { flex: 0 0 auto; }.ask-panel .ask-thread { padding: 0 18px; }.ask-composer { position: sticky; bottom: 14px; z-index: 20; margin-top: 14px; padding: 12px 16px 10px; border: 1px solid #d8e6f8; box-shadow: 0 10px 28px #23436d1b; }.ask-form { display: flex; gap: 8px; align-items: center; }.chat-send { display: grid; place-items: center; flex: 0 0 42px; width: 42px; height: 42px; border: 0; border-radius: 50%; background: #2563eb; color: #fff; font-size: 23px; line-height: 1; cursor: pointer; box-shadow: 0 4px 10px #2563eb38; }.chat-send:disabled { opacity: .45; cursor: wait; box-shadow: none; }.chat-send .spinner { margin: 0; }.ask-inline-error { color: #a83232; }.ask-scope { display: flex; justify-content: space-between; align-items: center; gap: 10px; }.ask-scope-actions { display: inline-flex; gap: 10px; flex: 0 0 auto; }.ask-history { margin-top: 10px; max-height: 240px; overflow-y: auto; border-top: 1px solid #edf1f6; padding-top: 8px; }.ask-history ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }.ask-history li { display: flex; align-items: center; gap: 8px; border-radius: 8px; padding: 2px 6px; }.ask-history li.is-current { background: #eaf2ff; }.ask-history-item { flex: 1; min-width: 0; display: grid; gap: 2px; text-align: left; border: 0; background: transparent; padding: 6px 4px; cursor: pointer; font: inherit; color: #34435b; }.ask-history-item strong { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.ask-history-item small { color: #8a97aa; font-size: 11px; }.ask-history-empty { margin: 6px 0; color: #8a97aa; font-size: 12px; }.danger-text { color: #c8555d; }.ask-proposal { margin-top: 8px; padding: 10px 12px; border: 1px solid #dbe6f5; border-radius: 10px; background: #fff; color: #52627a; font-size: 12px; }.ask-proposal.is-applied { border-color: #c9ebd9; background: #f3fbf7; }.ask-proposal.is-ignored, .ask-proposal.is-failed { opacity: .8; }.ask-proposal.is-failed { border-color: #f1d0d0; background: #fff6f6; }.ask-proposal-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; color: #34435b; }.ask-proposal-status { padding: 2px 8px; border-radius: 99px; background: #fff4da; color: #8a6924; font-size: 11px; }.ask-proposal.is-applied .ask-proposal-status { background: #e7f8f0; color: #12845e; }.ask-proposal-line { margin: 3px 0; white-space: normal; }.ask-proposal-line span { display: inline-block; min-width: 48px; color: #8a97aa; }.ask-proposal-line.is-error { color: #a83232; }.ask-proposal-actions { display: flex; gap: 8px; margin-top: 8px; }.ask-proposal-actions .primary { padding: 7px 14px; }.ask-form textarea { flex: 1; min-width: 0; min-height: 40px; max-height: 132px; resize: none; border: 1px solid #dbe2ee; border-radius: 8px; padding: 10px 12px; color: #44536a; background: #fbfcff; font: inherit; font-size: 13px; line-height: 1.45; outline: 0; }.ask-form textarea:focus { border-color: #3b82f6; }.ask-form { align-items: flex-end; }.ask-scope { margin: 9px 0 0; color: #8a97aa; font-size: 12px; }.ask-scope .text-button { padding: 0; font-size: 12px; }.ask-thread { display: grid; gap: 8px; margin-top: 12px; }.ask-message { max-width: 92%; padding: 9px 12px; border-radius: 10px; font-size: 13px; line-height: 1.6; }.ask-message p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }.ask-message small { display: block; margin-top: 5px; color: #8a97aa; font-size: 11px; }.ask-message small a { color: #2563eb; text-decoration: none; font-weight: 600; }.ask-message.is-user { justify-self: end; background: #2563eb; color: #fff; }.ask-message.is-assistant { justify-self: start; background: #f5f8fc; color: #52627a; }.ask-message.is-live p { display: flex; align-items: center; gap: 8px; color: #7c8ba1; }.ask-steps { margin: 0 0 6px; padding: 0; list-style: none; display: grid; gap: 3px; color: #7c8ba1; font-size: 11px; }.ask-steps li::before { content: '✓ '; color: #2563eb; }.ask-steps em { font-style: normal; color: #9aa6b6; }.ask-message .spinner.dark { margin: 0; }.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }@media(max-width: 760px){.ask-form{flex-wrap:wrap}.ask-form input{flex-basis:100%}}
 .panel { background: #fff; border-radius: 13px; box-shadow: 0 2px 8px #243b5a0d; }.add-button { margin-top: 1px; white-space: nowrap; text-decoration: none; }.manual-button { white-space: nowrap; }.primary { border: 0; border-radius: 8px; background: #2563eb; color: #fff; padding: 11px 18px; font-size: 13px; font-weight: 600; cursor: pointer; }.primary:hover { background: #1d4ed8; }.primary:disabled { opacity: .65; cursor: wait; }
-.filters { margin-top: 28px; padding: 16px 18px; }.filter-row { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; }.filter-field { flex: 1 1 135px; min-width: 120px; margin: 0; }.filter-field span { display: block; color: #7c8ba1; font-size: 12px; margin-bottom: 6px; }.filter-field select, .filter-field input { width: 100%; height: 38px; border: 1px solid #dbe2ee; border-radius: 8px; padding: 0 10px; color: #44536a; background: #fff; outline: none; font: inherit; font-size: 13px; }.filter-field select:focus, .filter-field input:focus { border-color: #3b82f6; }.clear-button { height: 38px; border: 0; background: #f1f5fb; color: #64748b; border-radius: 8px; padding: 0 15px; cursor: pointer; font-size: 13px; }.clear-button:hover { color: #2563eb; }
+.filters { margin-top: 28px; padding: 16px 18px; }.filter-row { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; }.filter-field { flex: 1 1 135px; min-width: 120px; margin: 0; }.filter-field span { display: block; color: #7c8ba1; font-size: 12px; margin-bottom: 6px; }.filter-field select, .filter-field input { width: 100%; height: 38px; border: 1px solid #dbe2ee; border-radius: 8px; padding: 0 10px; color: #44536a; background: #fff; outline: none; font: inherit; font-size: 13px; }.filter-field select:focus, .filter-field input:focus { border-color: #3b82f6; }.date-field { position: relative; }.date-field :deep(input) { width: 100%; height: 38px; border: 1px solid #dbe2ee; border-radius: 8px; padding: 0 10px; color: #44536a; background: #fff; outline: none; font: inherit; font-size: 13px; }.date-field :deep(input:focus) { border-color: #3b82f6; }.clear-button { height: 38px; border: 0; background: #f1f5fb; color: #64748b; border-radius: 8px; padding: 0 15px; cursor: pointer; font-size: 13px; }.clear-button:hover { color: #2563eb; }
 .setup-hint { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 13px; padding: 10px 14px; border-radius: 9px; background: #fff8e7; color: #8a6924; font-size: 12px; }.setup-hint a { color: #2563eb; text-decoration: none; font-weight: 600; white-space: nowrap; }
 .summary-row { display: flex; align-items: center; gap: 30px; padding: 20px 2px 16px; }.summary-item { display: flex; align-items: baseline; gap: 9px; }.summary-item span { color: #8996a9; font-size: 12px; }.summary-item strong { font-size: 16px; }.summary-count { margin-left: auto; color: #8996a9; font-size: 12px; }.income-text { color: #12966a; }.expense-text { color: #dc5a61; }.transfer-text { color: #64748b; }
 .table-panel { overflow: hidden; min-height: 330px; }.table-wrap { overflow-x: auto; }table { width: 100%; border-collapse: collapse; min-width: 900px; }th { background: #fafbfd; color: #8996a9; font-size: 11px; font-weight: 600; text-align: left; padding: 13px 18px; white-space: nowrap; }td { border-top: 1px solid #edf0f5; color: #516078; font-size: 13px; padding: 15px 18px; vertical-align: middle; }tr:hover td { background: #fcfdff; }.time-cell { color: #77869b; white-space: nowrap; }.amount-cell { font-weight: 700; white-space: nowrap; }.notes-cell { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.direction, .status { display: inline-flex; align-items: center; border-radius: 99px; padding: 4px 8px; font-size: 11px; white-space: nowrap; }.income-badge { color: #12845e; background: #e7f8f0; }.expense-badge { color: #c84d54; background: #fff0f0; }.transfer-badge { color: #526d99; background: #eff4fb; }.status-normal { color: #4f6c91; background: #eff4fb; }.status-voided { color: #9aa4b2; background: #f1f3f5; }.voided td { color: #a3acb8; }.actions-cell { white-space: nowrap; }.text-button { border: 0; background: transparent; padding: 3px 5px; color: #2563eb; font-size: 12px; cursor: pointer; }.text-button.danger { color: #d65b62; }.text-button:disabled { color: #b4bdc9; cursor: not-allowed; }.action-col { width: 105px; }

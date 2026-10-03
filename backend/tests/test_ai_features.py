@@ -11,7 +11,7 @@ import httpx2
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -33,7 +33,7 @@ from app.ai_service import (
 )
 from app.config import Settings
 from app.db import Base
-from app.models import AIConfig, Category, Partner, PartnerLedgerEntry, PaymentMethod, Transaction, User
+from app.models import AIConfig, AIConversation, AIConversationMessage, AIReport, Category, Partner, PartnerLedgerEntry, PaymentMethod, Transaction, User
 from app.schemas import TransactionCreate, TransactionUpdate
 import app.ai as ai_module
 import app.accounting as accounting_module
@@ -96,7 +96,13 @@ def test_reasoning_is_disabled_for_supported_model_families():
     assert reasoning_controls_for_provider(gpt) == {"reasoning_effort": "none"}
     assert reasoning_controls_for_provider(legacy) == {}
     # GPT-6 cannot disable reasoning; "low" is the fastest level it accepts.
-    assert reasoning_controls_for_provider(Provider("primary", "https://gateway.example", "sk-test", "gpt-6-luna")) == {"reasoning_effort": "low"}
+    gpt6 = Provider("primary", "https://gateway.example", "sk-test", "gpt-6-luna")
+    assert reasoning_controls_for_provider(gpt6) == {"reasoning_effort": "low"}
+    # Ledger questions and reports ask every family for its deepest reasoning.
+    assert reasoning_controls_for_provider(gpt6, "high") == {"reasoning_effort": "high"}
+    assert reasoning_controls_for_provider(gpt, "high") == {"reasoning_effort": "high"}
+    assert reasoning_controls_for_provider(deepseek, "high") == {"thinking": {"type": "enabled"}}
+    assert reasoning_controls_for_provider(legacy, "high") == {}
 
 
 def test_deepseek_json_mode_retries_empty_content_and_sets_token_limit(monkeypatch):
@@ -1417,8 +1423,9 @@ def test_parse_stream_endpoint_streams_sse(monkeypatch):
         return [frame async for frame in response.body_iterator]
 
     frames = [json.loads(frame[len("data: "):]) for frame in asyncio.run(collect()) if frame.startswith("data: ")]
-    assert [frame["type"] for frame in frames] == ["provider", "status", "result"]
-    assert frames[1] == {"type": "status", "code": "local_fallback"}
+    assert [frame["type"] for frame in frames] == ["intent", "provider", "status", "result"]
+    assert frames[0] == {"type": "intent", "intent": "bookkeeping"}
+    assert frames[2] == {"type": "status", "code": "local_fallback"}
     assert frames[-1]["data"]["source"] == "fallback"
 
 
@@ -1721,3 +1728,555 @@ def test_unshared_server_ai_channel_never_fills_in_a_users_missing_fields(monkey
     assert (providers[0].base_url, providers[0].model, providers[0].api_key) == ("https://api.openai.com", "my-model", "sk-mine-0000")
     assert all("owner" not in (item.base_url + item.model + (item.api_key or "")) for item in providers)
     assert ai_module.get_ai_config(None, db).api_key_hint == "••••0000"
+
+
+def test_swap_ai_channels_exchanges_both_channels_including_keys(monkeypatch):
+    db = _db()
+    user, _, _, _ = _fixtures(db)
+    service = _server_channel_service(False)
+    monkeypatch.setattr(ai_module, "service", service)
+    monkeypatch.setattr(ai_module, "_user", lambda request, session: user)
+    ai_module.put_ai_config(
+        ai_module.AIConfigUpdate(base_url="https://one.example", model="model-one", api_key="sk-one-1111", api_format="gemini", fallback_base_url="https://two.example", fallback_model="model-two", fallback_api_key="sk-two-2222", fallback_api_format="openai"),
+        None,
+        db,
+    )
+
+    swapped = ai_module.swap_ai_channels(None, db)
+
+    assert (swapped.base_url, swapped.model, swapped.api_format, swapped.api_key_hint) == ("https://two.example", "model-two", "openai", "••••2222")
+    assert (swapped.fallback_base_url, swapped.fallback_model, swapped.fallback_api_format, swapped.fallback_api_key_hint) == ("https://one.example", "model-one", "gemini", "••••1111")
+    primary, fallback = service.provider_chain_for_user(db, user.id)
+    assert (primary.model, primary.api_key, fallback.model, fallback.api_key) == ("model-two", "sk-two-2222", "model-one", "sk-one-1111")
+    # Swapping back restores the original configuration.
+    restored = ai_module.swap_ai_channels(None, db)
+    assert (restored.model, restored.fallback_model) == ("model-one", "model-two")
+
+
+def test_swap_ai_channels_fills_inherited_fallback_fields_and_needs_a_fallback_model(monkeypatch):
+    db = _db()
+    user, _, _, _ = _fixtures(db)
+    service = _server_channel_service(False)
+    monkeypatch.setattr(ai_module, "service", service)
+    monkeypatch.setattr(ai_module, "_user", lambda request, session: user)
+    ai_module.put_ai_config(ai_module.AIConfigUpdate(base_url="https://one.example", model="model-one", api_key="sk-one-1111"), None, db)
+
+    with pytest.raises(HTTPException) as error:
+        ai_module.swap_ai_channels(None, db)
+    assert error.value.status_code == 422
+
+    # Only the fallback model is set: it shares the primary address and key.
+    ai_module.put_ai_config(ai_module.AIConfigUpdate(fallback_model="model-two"), None, db)
+    swapped = ai_module.swap_ai_channels(None, db)
+
+    assert (swapped.base_url, swapped.model, swapped.api_key_hint) == ("https://one.example", "model-two", "••••1111")
+    assert (swapped.fallback_base_url, swapped.fallback_model, swapped.fallback_api_key_hint) == ("https://one.example", "model-one", "••••1111")
+
+
+def _calibration_fixtures(db: Session):
+    user, _, wechat, _ = _fixtures(db)
+    other_income = Category(user_id=user.id, name="其他收入", direction="income")
+    other_expense = Category(user_id=user.id, name="其他支出", direction="expense")
+    alipay = PaymentMethod(user_id=user.id, name="支付宝", account_role="cash", track_balance=True, current_balance_cents=100_000)
+    card = PaymentMethod(user_id=user.id, name="招行信用卡", account_role="liability", track_balance=True, current_balance_cents=60_000)
+    db.add_all([other_income, other_expense, alipay, card])
+    db.commit()
+    return user, other_income, other_expense, alipay, card
+
+
+def test_model_parse_turns_a_balance_report_into_a_calibration_draft(monkeypatch):
+    db = _db()
+    user, _, _, alipay, _ = _calibration_fixtures(db)
+    provider_result = {
+        "status": "complete",
+        "parsed": _record(kind="balance_check", direction=None, payment_method_name="支付宝", account_balance_cents=95_000),
+        "missing_fields": [],
+        "follow_up_question": None,
+        "brief_comment": None,
+        "extra_records": [],
+    }
+
+    result, captured = _parse_with_model(monkeypatch, db, user, provider_result, "支付宝现在余额950")
+
+    parsed = result.parsed
+    assert result.status == "complete" and result.missing_fields == []
+    assert (parsed.kind, parsed.direction, parsed.amount_cents, parsed.category_id) == ("balance_check", None, None, None)
+    assert (parsed.payment_method_id, parsed.account_balance_cents) == (alipay.id, 95_000)
+    assert (parsed.account_balance_expected_cents, parsed.account_balance_delta_cents) == (100_000, -5_000)
+    assert parsed.field_status == {"occurred_at": "inferred", "payment_method": "explicit", "account_balance_cents": "explicit"}
+    assert "余额校准" in result.brief_comment
+    assert "余额校准规则" in captured["system"]
+    assert "按现金流入处理" not in captured["system"]
+    assert "balance_check" in captured["response_format"]["json_schema"]["schema"]["properties"]["parsed"]["properties"]["kind"]["enum"]
+
+
+def test_model_parse_reports_a_balance_check_without_an_amount_as_incomplete(monkeypatch):
+    db = _db()
+    user, _, _, _, _ = _calibration_fixtures(db)
+    provider_result = {
+        "status": "need_more_info",
+        "parsed": _record(kind="balance_check", direction=None, payment_method_name="支付宝"),
+        "missing_fields": ["account_balance_cents"],
+        "follow_up_question": None,
+        "brief_comment": None,
+        "extra_records": [],
+    }
+
+    result, _ = _parse_with_model(monkeypatch, db, user, provider_result, "校准一下支付宝余额")
+
+    assert result.status == "need_more_info"
+    assert result.missing_fields == ["account_balance_cents"]
+    assert result.follow_up_question == "请补充：账户当前余额。"
+
+
+def _confirm_calibration(monkeypatch, db, user, **draft):
+    service = AIService(Settings(_env_file=None, secret_key="s" * 64, ai_api_key=None))
+    monkeypatch.setattr(ai_module, "service", service)
+    monkeypatch.setattr(ai_module, "_user", lambda request, session: user)
+    return confirm_ai_draft(AIConfirmRequest(confirm=True, draft=AIParsedTransaction(kind="balance_check", **draft)), None, db)
+
+
+def test_confirming_a_calibration_books_the_difference_on_a_cash_account(monkeypatch):
+    db = _db()
+    user, _, other_expense, alipay, _ = _calibration_fixtures(db)
+
+    response = _confirm_calibration(monkeypatch, db, user, payment_method_id=alipay.id, account_balance_cents=95_000)
+
+    tx = response.transaction
+    assert (tx["kind"], tx["direction"], tx["amount_cents"], tx["category_id"], tx["source"]) == ("cashflow", "expense", 5_000, other_expense.id, "ai")
+    assert tx["notes"] == "余额校准：系统 1000.00 → 实际 950.00"
+    assert db.get(PaymentMethod, alipay.id).current_balance_cents == 95_000
+
+
+def test_confirming_a_calibration_on_a_liability_treats_more_debt_as_an_expense(monkeypatch):
+    db = _db()
+    user, other_income, other_expense, _, card = _calibration_fixtures(db)
+
+    more_debt = _confirm_calibration(monkeypatch, db, user, payment_method_id=card.id, account_balance_cents=70_000)
+    assert (more_debt.transaction["direction"], more_debt.transaction["amount_cents"], more_debt.transaction["category_id"]) == ("expense", 10_000, other_expense.id)
+    assert db.get(PaymentMethod, card.id).current_balance_cents == 70_000
+
+    less_debt = _confirm_calibration(monkeypatch, db, user, payment_method_id=card.id, account_balance_cents=65_000, notes="对账")
+    assert (less_debt.transaction["direction"], less_debt.transaction["amount_cents"], less_debt.transaction["category_id"], less_debt.transaction["notes"]) == ("income", 5_000, other_income.id, "对账")
+    assert db.get(PaymentMethod, card.id).current_balance_cents == 65_000
+
+
+def test_confirming_a_calibration_rejects_an_unchanged_balance(monkeypatch):
+    db = _db()
+    user, _, _, alipay, _ = _calibration_fixtures(db)
+
+    with pytest.raises(HTTPException) as error:
+        _confirm_calibration(monkeypatch, db, user, payment_method_id=alipay.id, account_balance_cents=100_000)
+
+    assert error.value.status_code == 422
+    assert "一致" in error.value.detail
+    assert db.query(Transaction).count() == 0
+
+
+def test_batch_confirm_accepts_a_calibration_next_to_a_cashflow(monkeypatch):
+    db = _db()
+    user, _, other_expense, alipay, _ = _calibration_fixtures(db)
+    monkeypatch.setattr(ai_module, "_user", lambda request, session: user)
+    payload = AIBatchConfirmRequest(
+        confirm=True,
+        drafts=[
+            AIParsedTransaction(direction="expense", amount_cents=1_200, category_id=other_expense.id, payment_method_id=alipay.id, notes="早餐"),
+            AIParsedTransaction(kind="balance_check", payment_method_id=alipay.id, account_balance_cents=95_000),
+        ],
+    )
+
+    response = confirm_ai_drafts(payload, None, db)
+
+    assert [(item["direction"], item["amount_cents"]) for item in response.transactions] == [("expense", 1_200), ("expense", 3_800)]
+    assert db.get(PaymentMethod, alipay.id).current_balance_cents == 95_000
+
+
+def _scoped_ledger(db: Session):
+    user, category, wechat, _ = _fixtures(db)
+    alipay = PaymentMethod(user_id=user.id, name="支付宝")
+    dining = Category(user_id=user.id, name="餐饮", direction="expense")
+    db.add_all([alipay, dining])
+    db.flush()
+    when = datetime(2026, 8, 5, 4, 0, tzinfo=timezone.utc)
+    db.add_all([
+        Transaction(user_id=user.id, occurred_at=when, direction="expense", amount_cents=1_000, category_id=category.id, payment_method_id=wechat.id, status="normal"),
+        Transaction(user_id=user.id, occurred_at=when, direction="expense", amount_cents=3_500, category_id=dining.id, payment_method_id=alipay.id, status="normal"),
+        Transaction(user_id=user.id, occurred_at=when, direction="income", amount_cents=20_000, category_id=None, payment_method_id=alipay.id, status="normal"),
+    ])
+    db.commit()
+    return user, category, dining, wechat, alipay
+
+
+def test_period_summary_can_be_scoped_to_an_account_or_category():
+    from app.ai_insights import resolve_period, summarize_period
+
+    db = _db()
+    user, category, dining, wechat, alipay = _scoped_ledger(db)
+    spec = resolve_period("month", today=datetime(2026, 8, 20).date())
+
+    everything = summarize_period(db, user.id, spec)
+    by_account = summarize_period(db, user.id, spec, scope={"payment_method_id": alipay.id})
+    by_category = summarize_period(db, user.id, spec, scope={"category_id": category.id, "direction": "expense"})
+
+    assert (everything["income_cents"], everything["expense_cents"]) == (20_000, 4_500)
+    assert "scope" not in everything
+    assert (by_account["income_cents"], by_account["expense_cents"], by_account["scope"]) == (20_000, 3_500, {"账户": "支付宝"})
+    assert list(by_account["categories"]) == ["未分类", "餐饮"] or set(by_account["categories"]) == {"未分类", "餐饮"}
+    assert (by_category["income_cents"], by_category["expense_cents"], by_category["scope"]) == (0, 1_000, {"分类": "进货", "类型": "仅支出"})
+
+
+def test_chat_endpoint_honours_an_explicit_intent_and_scope(monkeypatch):
+    db = _db()
+    user, _, _, _, alipay = _scoped_ledger(db)
+    service = AIService(Settings(_env_file=None, secret_key="s" * 64, ai_api_key="sk-test"))
+    captured = {}
+
+    def fake_chat(provider, messages, **kwargs):
+        captured["system"] = messages[0]["content"]
+        captured["effort"] = kwargs.get("effort")
+        captured["max_tokens"] = kwargs.get("max_tokens")
+        return "支付宝本月支出 35.00 元。"
+
+    monkeypatch.setattr(service, "_chat", fake_chat)
+    monkeypatch.setattr(ai_module, "service", service)
+    monkeypatch.setattr(ai_module, "_user", lambda request, session: user)
+    # The sentence alone would be classified as bookkeeping ("花了…元").
+    payload = ai_module.AIChatRequest(text="花了多少元", intent="query", period="custom", start_date=datetime(2026, 8, 1).date(), end_date=datetime(2026, 8, 31).date(), payment_method_id=alipay.id)
+
+    response = ai_module.chat_about_finances(payload, None, db)
+
+    assert response.intent == "query"
+    assert response.scope == {"账户": "支付宝"}
+    assert response.summary["expense_cents"] == 3_500
+    assert "数据范围已限定为：账户=支付宝" in captured["system"]
+    assert captured["effort"] == "high"
+    assert captured["max_tokens"] == 16_000
+
+
+def test_native_formats_request_deep_reasoning_for_analysis(monkeypatch):
+    _, _, requests = _gemini_chat(monkeypatch, [_FakeStreamResponse([_gemini_line({"text": "好的"})])], effort="high")
+    assert requests[0]["body"]["generationConfig"]["thinkingConfig"] == {"includeThoughts": True, "thinkingLevel": "high"}
+
+    _, _, captured = _anthropic_chat(monkeypatch, [_anthropic_answer("好的")], effort="high")
+    assert captured["requests"][0]["output_config"]["effort"] == "max"
+
+
+# ---------------------------------------------------------------------------
+# Tool-using ledger agent
+# ---------------------------------------------------------------------------
+
+from app import ai_agent
+
+
+def _agent_db():
+    db = _db()
+    user, category, dining, wechat, alipay = _scoped_ledger(db)
+    return db, user, category, dining, wechat, alipay
+
+
+def test_ledger_tools_summarize_list_and_scope():
+    db, user, category, dining, wechat, alipay = _agent_db()
+    tools = ai_agent.LedgerTools(db, user.id)
+
+    summary = tools.call("summarize_period", {"period": "custom", "start_date": "2026-08-01", "end_date": "2026-08-31", "payment_method_id": alipay.id})
+    assert (summary["income_cents"], summary["expense_cents"], summary["scope"]) == (20_000, 3_500, {"账户": "支付宝"})
+
+    rows = tools.call("list_transactions", {"start_date": "2026-08-05", "end_date": "2026-08-05", "direction": "expense", "limit": 10})
+    assert rows["total"] == 2 and [item["amount_cents"] for item in rows["transactions"]] == [3_500, 1_000] or sorted(item["amount_cents"] for item in rows["transactions"]) == [1_000, 3_500]
+    assert rows["transactions"][0]["account"] in {"支付宝", "微信"}
+
+    accounts = tools.call("list_accounts", {})
+    assert {item["name"] for item in accounts["accounts"]} == {"微信", "支付宝"}
+    assert tools.call("summarize_period", {"period": "custom"}) == {"error": "custom 周期需要有效的 start_date 和 end_date（start_date 不晚于 end_date）"}
+    assert tools.call("nope", {})["error"].startswith("未知工具")
+
+
+def _agent_service(api_format: str, model: str) -> AIService:
+    service = AIService(Settings(_env_file=None, secret_key="s" * 64, ai_api_key="sk-test", ai_base_url="https://gateway.example", ai_model=model, ai_api_format=api_format, ai_local_fallback=False))
+    return service
+
+
+def _run_agent(service, db, user, emit=None, text="支付宝 8 月花了多少？"):
+    events = []
+    result = ai_agent.run_ledger_agent(service, db, user.id, text, [], "query", events.append)
+    return (result.content, result.source, result.warning, result.model, result.steps), events, result
+
+
+def test_openai_agent_loop_calls_a_tool_then_answers(monkeypatch):
+    db, user, _, _, _, alipay = _agent_db()
+    user.alipay_id = alipay.id
+    requests = []
+    responses = [
+        {"choices": [{"message": {"role": "assistant", "content": None, "reasoning_content": "先查汇总", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "summarize_period", "arguments": json.dumps({"period": "custom", "start_date": "2026-08-01", "end_date": "2026-08-31", "payment_method_id": alipay.id})}}]}}]},
+        {"choices": [{"message": {"role": "assistant", "content": "支付宝 8 月支出 35.00 元。"}}]},
+    ]
+
+    class FakeResponse:
+        def __init__(self, data):
+            self.status_code, self._data, self.text = 200, data, ""
+
+        def json(self):
+            return self._data
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers, json):
+            requests.append({"url": url, "body": json})
+            return FakeResponse(responses[len(requests) - 1])
+
+    monkeypatch.setattr("app.ai_agent.httpx.Client", FakeClient)
+    (content, source, warning, model, steps), events, result = _run_agent(_agent_service("openai", "gpt-6-luna"), db, user)
+
+    assert (content, source, warning, model) == ("支付宝 8 月支出 35.00 元。", "model", None, "gpt-6-luna")
+    assert (result.period.kind, result.period.start.isoformat(), result.period.end.isoformat()) == ("custom", "2026-08-01", "2026-08-31")
+    assert steps == [{"name": "summarize_period", "summary": "统计自定义区间 2026-08-01 2026-08-31 · 账户=支付宝", "result": "2 笔，收入 200.00，支出 35.00"}]
+    assert [event["type"] for event in events] == ["provider", "tool", "tool_result"]
+    first, second = requests
+    assert first["url"] == "https://gateway.example/v1/chat/completions"
+    assert first["body"]["tool_choice"] == "auto" and first["body"]["reasoning_effort"] == "high"
+    assert [tool["function"]["name"] for tool in first["body"]["tools"]] == ["summarize_period", "list_transactions", "propose_update", "propose_void", "propose_create", "list_accounts", "list_partners"]
+    system = first["body"]["messages"][0]["content"]
+    assert "【当前时间】" in system and "【工具调用方法】" in system and "【约束】" in system
+    assert f"{alipay.id}=支付宝(现金)" in system and "视图" not in system
+    # The second round carries the assistant turn (reasoning included) and the tool result.
+    assert second["body"]["messages"][-2]["reasoning_content"] == "先查汇总"
+    assert second["body"]["messages"][-1]["role"] == "tool" and '"expense_cents": 3500' in second["body"]["messages"][-1]["content"]
+
+
+def test_gemini_agent_loop_echoes_the_model_turn(monkeypatch):
+    db, user, _, _, _, alipay = _agent_db()
+    user.alipay_id = alipay.id
+    requests = []
+    responses = [
+        {"candidates": [{"content": {"role": "model", "parts": [{"functionCall": {"id": "fc_1", "name": "list_accounts", "args": {}}, "thoughtSignature": "sig"}]}}]},
+        {"candidates": [{"content": {"role": "model", "parts": [{"text": "你有两个账户。"}]}}]},
+    ]
+
+    class FakeResponse:
+        def __init__(self, data):
+            self.status_code, self._data, self.text = 200, data, ""
+
+        def json(self):
+            return self._data
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers, json):
+            requests.append({"url": url, "headers": headers, "body": json})
+            return FakeResponse(responses[len(requests) - 1])
+
+    monkeypatch.setattr("app.ai_agent.httpx.Client", FakeClient)
+    (content, source, _, _, steps), _, _ = _run_agent(_agent_service("gemini", "gemini-3.8-flash-high"), db, user)
+
+    assert (content, source) == ("你有两个账户。", "model")
+    assert steps[0]["name"] == "list_accounts"
+    first, second = requests
+    assert first["url"] == "https://gateway.example/v1beta/models/gemini-3.8-flash-high:generateContent"
+    assert first["headers"]["x-goog-api-key"] == "sk-test"
+    assert first["body"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "high"}
+    declaration = first["body"]["tools"][0]["functionDeclarations"][0]
+    assert declaration["name"] == "summarize_period" and "additionalProperties" not in declaration["parameters"]
+    assert second["body"]["contents"][-2] == {"role": "model", "parts": [{"functionCall": {"id": "fc_1", "name": "list_accounts", "args": {}}, "thoughtSignature": "sig"}]}
+    response = second["body"]["contents"][-1]["parts"][0]["functionResponse"]
+    assert (response["name"], response["id"]) == ("list_accounts", "fc_1")
+
+
+def test_anthropic_agent_loop_uses_tool_use_blocks(monkeypatch):
+    db, user, _, _, _, alipay = _agent_db()
+    user.alipay_id = alipay.id
+    captured = {"requests": []}
+    tool_turn = SimpleNamespace(stop_reason="tool_use", content=[SimpleNamespace(type="thinking", thinking="…"), SimpleNamespace(type="tool_use", id="toolu_1", name="summarize_period", input={"period": "month"})])
+    final_turn = SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text="本月支出 35.00 元。")])
+    outcomes = [_FakeAnthropicStream([], tool_turn), _FakeAnthropicStream([], final_turn)]
+
+    class FakeAnthropic:
+        def __init__(self, **options):
+            captured["options"] = options
+            self.messages = self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def stream(self, **params):
+            captured["requests"].append(params)
+            return outcomes[len(captured["requests"]) - 1]
+
+    monkeypatch.setattr("app.ai_agent.anthropic.Anthropic", FakeAnthropic)
+    (content, source, _, _, steps), _, _ = _run_agent(_agent_service("anthropic", "claude-sonnet-4-6"), db, user)
+
+    assert (content, source) == ("本月支出 35.00 元。", "model")
+    assert steps[0]["name"] == "summarize_period"
+    first, second = captured["requests"]
+    assert first["tools"][0]["name"] == "summarize_period" and first["thinking"] == {"type": "adaptive"} and first["output_config"] == {"effort": "max"}
+    assert second["messages"][-2] == {"role": "assistant", "content": tool_turn.content}
+    assert second["messages"][-1]["content"][0]["tool_use_id"] == "toolu_1"
+
+
+def test_agent_falls_back_to_local_answer_when_no_channel_answers(monkeypatch):
+    db, user, _, _, _, alipay = _agent_db()
+    user.alipay_id = alipay.id
+    monkeypatch.setattr(ai_agent, "_post_json", lambda *args, **kwargs: (_ for _ in ()).throw(AIServiceError("provider_unavailable")))
+
+    (content, source, warning, model, steps), events, result = _run_agent(_agent_service("openai", "gpt-6-luna"), db, user, text="8 月花了多少？")
+
+    assert source == "fallback" and model is None and steps == []
+    assert "本地回答" in warning and "45.00" in content
+    assert events[-1] == {"type": "status", "code": "local_fallback"}
+    assert result.period.kind == "month" and result.period.start.isoformat() == "2026-08-01"
+
+
+def test_ask_endpoint_streams_tool_events_and_saves_a_report(monkeypatch):
+    db, user, _, _, _, alipay = _agent_db()
+    service = _agent_service("openai", "gpt-6-luna")
+    monkeypatch.setattr(ai_module, "service", service)
+    monkeypatch.setattr(ai_module, "_user", lambda request, session: user)
+    monkeypatch.setattr(ai_module, "SessionLocal", lambda: db)
+
+    from app.ai_insights import resolve_period
+
+    def fake_agent(service_, session, user_id, text, conversation, intent, emit):
+        emit({"type": "tool", "name": "summarize_period", "summary": "统计"})
+        return ai_agent.AgentResult("【报告】支出 35.00 元。", "model", None, "gpt-6-luna", [{"name": "summarize_period", "summary": "统计", "result": "ok"}], resolve_period("custom", datetime(2026, 8, 1).date(), datetime(2026, 8, 31).date()))
+
+    monkeypatch.setattr(ai_module, "run_ledger_agent", fake_agent)
+    payload = ai_module.AIChatRequest(text="生成 2026-08-01 至 2026-08-31 的收支报告", intent="report")
+    response = ai_module.ask_ledger(payload, None, db)
+
+    async def collect():
+        return [frame async for frame in response.body_iterator]
+
+    frames = [json.loads(frame[len("data: "):]) for frame in asyncio.run(collect()) if frame.startswith("data: ")]
+    assert [frame["type"] for frame in frames] == ["tool", "result"]
+    result = frames[-1]["data"]
+    assert result["reply"] == "【报告】支出 35.00 元。" and result["steps"][0]["name"] == "summarize_period"
+    assert result["period"]["start_date"] == "2026-08-01" and result["period"]["end_date"] == "2026-08-31"
+    assert result["report_id"] == db.query(AIReport).one().id
+
+
+def test_api_errors_reach_the_client_in_chinese():
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    unauthenticated = client.get("/api/transactions")
+    assert (unauthenticated.status_code, unauthenticated.json()["detail"]) == (401, "请先登录。")
+    invalid = client.post("/api/auth/login", json={"username": "x"})
+    assert invalid.status_code == 422
+    assert invalid.json()["detail"] == "请求内容有误（password：缺少必填项）。"
+    from app.errors import localize_detail
+
+    assert localize_detail("第 2 笔：Category is required") == "第 2 笔：请选择分类。"
+    assert localize_detail("自定义文案") == "自定义文案"
+
+
+def test_ask_endpoint_passes_only_the_question_to_the_agent(monkeypatch):
+    db, user, _, _, _, alipay = _agent_db()
+    service = _agent_service("openai", "gpt-6-luna")
+    monkeypatch.setattr(ai_module, "service", service)
+    monkeypatch.setattr(ai_module, "_user", lambda request, session: user)
+    monkeypatch.setattr(ai_module, "SessionLocal", lambda: db)
+    seen = {}
+
+    def fake_agent(service_, session, user_id, text, conversation, intent, emit):
+        seen.update(text=text, intent=intent)
+        return ai_agent.AgentResult("好的", "model", None, "gpt-6-luna", [], None)
+
+    monkeypatch.setattr(ai_module, "run_ledger_agent", fake_agent)
+    # Page filters (even an unusable date range) are ignored by the assistant.
+    payload = ai_module.AIChatRequest(text="花了多少", intent="query", period="custom", start_date=datetime(2026, 8, 31).date(), end_date=datetime(2026, 8, 1).date(), payment_method_id=alipay.id)
+    response = ai_module.ask_ledger(payload, None, db)
+
+    async def collect():
+        return [frame async for frame in response.body_iterator]
+
+    frames = [json.loads(frame[len("data: "):]) for frame in asyncio.run(collect()) if frame.startswith("data: ")]
+    assert frames[-1]["type"] == "result" and frames[-1]["data"]["reply"] == "好的"
+    assert seen == {"text": "花了多少", "intent": "query"}
+
+
+def test_proposal_tools_only_plan_changes():
+    db, user, category, dining, wechat, alipay = _agent_db()
+    tools = ai_agent.LedgerTools(db, user.id)
+    target = db.scalar(select(Transaction).where(Transaction.amount_cents == 3_500))
+    before_count = db.query(Transaction).count()
+
+    update = tools.call("propose_update", {"transaction_id": target.id, "amount_cents": 3_600, "payment_method_id": wechat.id, "occurred_at": "2026-08-06 09:30", "reason": "记错了"})
+    void = tools.call("propose_void", {"transaction_id": target.id, "reason": "重复"})
+    create = tools.call("propose_create", {"kind": "cashflow", "direction": "expense", "amount_cents": 1_200, "category_id": dining.id, "payment_method_id": alipay.id, "occurred_at": "2026-08-07", "notes": "早餐"})
+    bad = tools.call("propose_update", {"transaction_id": 99_999, "amount_cents": 1})
+
+    assert update["proposal"]["before"]["amount_cents"] == 3_500 and update["proposal"]["after"]["amount_cents"] == 3_600
+    assert update["proposal"]["after"]["account"] == "微信" and update["proposal"]["after"]["occurred_at"] == "2026-08-06 09:30"
+    assert update["proposal"]["changes"]["occurred_at"] == "2026-08-06T01:30:00+00:00"
+    assert void["proposal"]["type"] == "void" and void["proposal"]["before"]["id"] == target.id
+    assert create["proposal"]["draft"]["occurred_at"] == "2026-08-06T16:00:00+00:00" and create["proposal"]["after"]["category"] == "餐饮"
+    assert bad == {"error": "找不到这笔流水，请先用 list_transactions 确认 id"}
+    assert [item["status"] for item in tools.proposals] == ["pending", "pending", "pending"]
+    # Nothing was written.
+    assert db.query(Transaction).count() == before_count and db.get(Transaction, target.id).amount_cents == 3_500
+
+
+def test_ask_endpoint_stores_the_thread_and_history_endpoints_serve_it(monkeypatch):
+    db, user, _, _, _, alipay = _agent_db()
+    service = _agent_service("openai", "gpt-6-luna")
+    monkeypatch.setattr(ai_module, "service", service)
+    monkeypatch.setattr(ai_module, "_user", lambda request, session: user)
+    # The endpoint opens its own session per question, as in production.
+    monkeypatch.setattr(ai_module, "SessionLocal", lambda: Session(db.get_bind(), expire_on_commit=False))
+    seen = []
+
+    def fake_agent(service_, session, user_id, text, conversation, intent, emit):
+        seen.append([item["content"] for item in conversation])
+        proposal = {"type": "void", "transaction_id": 1, "before": {"id": 1}, "index": 0, "status": "pending"}
+        return ai_agent.AgentResult(f"回答：{text}", "model", None, "gpt-6-luna", [{"name": "list_accounts", "summary": "查", "result": "ok"}], None, [proposal])
+
+    monkeypatch.setattr(ai_module, "run_ledger_agent", fake_agent)
+
+    def ask(text, conversation_id=None):
+        response = ai_module.ask_ledger(ai_module.AIChatRequest(text=text, intent="query", conversation_id=conversation_id), None, db)
+
+        async def collect():
+            return [frame async for frame in response.body_iterator]
+
+        return [json.loads(frame[len("data: "):]) for frame in asyncio.run(collect()) if frame.startswith("data: ")][-1]["data"]
+
+    first = ask("第一个问题")
+    second = ask("第二个问题", first["conversation_id"])
+
+    assert first["conversation_id"] == second["conversation_id"] and first["message_id"] != second["message_id"]
+    assert first["proposals"][0]["type"] == "void"
+    # The second question saw the stored first turn as context.
+    assert seen == [[], ["第一个问题", "回答：第一个问题"]]
+    threads = ai_module.list_conversations(None, db, limit=30)
+    assert [(item.title, item.message_count) for item in threads] == [("第一个问题", 4)]
+    detail = ai_module.get_conversation(first["conversation_id"], None, db)
+    assert [item["role"] for item in detail.messages] == ["user", "assistant", "user", "assistant"]
+    assert detail.messages[1]["steps"][0]["name"] == "list_accounts" and detail.messages[1]["proposals"][0]["status"] == "pending"
+
+    marked = ai_module.set_proposal_status(first["conversation_id"], first["message_id"], 0, ai_module.AIProposalStatus(status="applied"), None, db)
+    assert marked["proposals"][0]["status"] == "applied"
+    assert ai_module.get_conversation(first["conversation_id"], None, db).messages[1]["proposals"][0]["status"] == "applied"
+    with pytest.raises(HTTPException):
+        ai_module.set_proposal_status(first["conversation_id"], first["message_id"], 5, ai_module.AIProposalStatus(status="ignored"), None, db)
+
+    ai_module.delete_conversation(first["conversation_id"], None, db)
+    assert ai_module.list_conversations(None, db, limit=30) == [] and db.query(AIConversationMessage).count() == 0

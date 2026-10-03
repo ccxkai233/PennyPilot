@@ -518,61 +518,16 @@ export const aiApi = {
    * the promise resolves with the same payload as ``parseMode``.  A backend
    * without the streaming route is asked through ``parseMode`` instead.
    */
-  parseStream: async (mode, data = {}, { onEvent, timeoutMs = 200_000, ...requestOptions } = {}) => {
-    const path = '/api/ai/parse-stream'
-    const requestSignal = createTimeoutSignal(requestOptions.signal, timeoutMs)
-    const failure = (status, payload, cause) => {
-      const info = classifyApiFailure(path, status, payload, cause, requestSignal.timedOut())
-      return new ApiError(info.message || errorMessage(payload, `请求失败（${status}）`), status, payload, { kind: info.kind, retryable: info.retryable, path, cause })
-    }
-    try {
-      let response
-      try {
-        response = await fetch(`${API_BASE_URL}${path}`, {
-          method: 'POST',
-          body: JSON.stringify({ ...data, mode }),
-          headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
-          credentials: 'include',
-          signal: requestSignal.signal,
-        })
-      } catch (cause) {
-        throw failure(0, null, cause)
-      }
-      if ([404, 405].includes(response.status) || (response.ok && !response.body)) return await aiApi.parseMode(mode, data, requestOptions)
-      if (!response.ok) {
-        if (response.status === 401 && typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('pennypilot:unauthorized'))
-        throw failure(response.status, await response.json().catch(() => null), null)
-      }
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      for (;;) {
-        let chunk
-        try {
-          chunk = await reader.read()
-        } catch (cause) {
-          throw failure(0, null, cause)
-        }
-        if (chunk.done) break
-        buffer += decoder.decode(chunk.value, { stream: true })
-        let boundary
-        while ((boundary = buffer.indexOf('\n\n')) >= 0) {
-          const line = buffer.slice(0, boundary).split('\n').find((item) => item.startsWith('data:'))
-          buffer = buffer.slice(boundary + 2)
-          if (!line) continue
-          let event
-          try { event = JSON.parse(line.slice(5)) } catch { continue }
-          if (event.type === 'result') return event.data
-          if (event.type === 'error') throw failure(event.status || 503, { detail: event.detail }, null)
-          try { onEvent?.(event) } catch { /* UI callbacks must not break the stream */ }
-        }
-      }
-      // The stream closed without its final result/error event.
-      throw failure(502, null, null)
-    } finally {
-      requestSignal.cleanup()
-    }
-  },
+  parseStream: (mode, data = {}, options = {}) => readAiStream('/api/ai/parse-stream', { ...data, mode }, options, (requestOptions) => aiApi.parseMode(mode, data, requestOptions)),
+  /**
+   * Ask the tool-using ledger assistant.  Progress (provider, tool calls) is
+   * reported through ``onEvent``; the promise resolves with the answer.
+   */
+  askStream: (data = {}, options = {}) => readAiStream('/api/ai/ask', data, options, (requestOptions) => aiApi.chat(data, requestOptions)),
+  conversations: (limit = 30) => apiFetch(`/api/ai/conversations?limit=${limit}`),
+  conversation: (id) => apiFetch(`/api/ai/conversations/${id}`),
+  deleteConversation: (id) => apiFetch(`/api/ai/conversations/${id}`, { method: 'DELETE' }),
+  setProposalStatus: (conversationId, messageId, index, status, detail = null) => apiFetch(`/api/ai/conversations/${conversationId}/messages/${messageId}/proposals/${index}`, { method: 'POST', body: detail ? { status, detail } : { status } }),
   confirm: (data) => apiFetch('/api/ai/confirm', { method: 'POST', body: data }),
   /**
    * Confirm a proposal while preserving its cash/current-account mode.
@@ -622,7 +577,8 @@ export const aiApi = {
     method: 'POST',
     body: data,
     retry: 1,
-    timeoutMs: 60_000,
+    // Answers run at full reasoning depth, which can take a while.
+    timeoutMs: 150_000,
     ...requestOptions,
   }),
   analyze: (data = {}, requestOptions = {}) => apiFetch('/api/ai/analyze', {
@@ -637,6 +593,8 @@ export const aiApi = {
     if (error instanceof ApiError && [404, 405].includes(error.status)) return apiFetch('/api/ai/config', { method: 'PATCH', body: data })
     throw error
   }),
+  /** Swap the primary and fallback channels server-side; keys stay encrypted. */
+  swapConfig: () => apiFetch('/api/ai/config/swap', { method: 'POST' }),
   clearConfig: () => apiFetch('/api/ai/config', { method: 'DELETE' }).catch((error) => {
     if (error instanceof ApiError && [404, 405].includes(error.status)) return apiFetch('/api/ai/config', { method: 'PATCH', body: { clear_api_key: true } })
     throw error
@@ -663,4 +621,64 @@ export const settlementsApi = {
 export const feedbackApi = {
   list: (filters = {}) => apiFetch(`/api/feedback${queryString(filters)}`).then(listPayload),
   create: (data) => apiFetch('/api/feedback', { method: 'POST', body: data }),
+}
+
+/**
+ * Read a server-sent event stream from an AI endpoint.  Events are passed to
+ * ``onEvent`` until the final ``result``/``error`` event resolves or rejects
+ * the promise; a backend without the route is asked through ``legacy``.
+ */
+async function readAiStream(path, body, { onEvent, timeoutMs = 200_000, ...requestOptions } = {}, legacy) {
+    const requestSignal = createTimeoutSignal(requestOptions.signal, timeoutMs)
+  const failure = (status, payload, cause) => {
+    const info = classifyApiFailure(path, status, payload, cause, requestSignal.timedOut())
+    return new ApiError(info.message || errorMessage(payload, `请求失败（${status}）`), status, payload, { kind: info.kind, retryable: info.retryable, path, cause })
+  }
+  try {
+    let response
+    try {
+      response = await fetch(`${API_BASE_URL}${path}`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
+        credentials: 'include',
+        signal: requestSignal.signal,
+      })
+    } catch (cause) {
+      throw failure(0, null, cause)
+    }
+    if ([404, 405].includes(response.status) || (response.ok && !response.body)) return await legacy(requestOptions)
+    if (!response.ok) {
+      if (response.status === 401 && typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('pennypilot:unauthorized'))
+      throw failure(response.status, await response.json().catch(() => null), null)
+    }
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    for (;;) {
+      let chunk
+      try {
+        chunk = await reader.read()
+      } catch (cause) {
+        throw failure(0, null, cause)
+      }
+      if (chunk.done) break
+      buffer += decoder.decode(chunk.value, { stream: true })
+      let boundary
+      while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+        const line = buffer.slice(0, boundary).split('\n').find((item) => item.startsWith('data:'))
+        buffer = buffer.slice(boundary + 2)
+        if (!line) continue
+        let event
+        try { event = JSON.parse(line.slice(5)) } catch { continue }
+        if (event.type === 'result') return event.data
+        if (event.type === 'error') throw failure(event.status || 503, { detail: event.detail }, null)
+        try { onEvent?.(event) } catch { /* UI callbacks must not break the stream */ }
+      }
+    }
+    // The stream closed without its final result/error event.
+    throw failure(502, null, null)
+  } finally {
+    requestSignal.cleanup()
+  }
 }

@@ -16,12 +16,13 @@ import threading
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import inspect, select, text
+from sqlalchemy import delete, func, inspect, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .accounting import (
     _apply_transaction_balance,
+    _owned_method,
     _owned_method_pair,
     _owned_optional_category,
     _transaction_payload,
@@ -43,6 +44,9 @@ from .ai_schemas import (
     AIChatRequest,
     AIChatResponse,
     AIConfigRead,
+    AIConversationRead,
+    AIConversationSummary,
+    AIProposalStatus,
     AIConfigUpdate,
     AIConfirmRequest,
     AIConfirmResponse,
@@ -54,11 +58,12 @@ from .ai_schemas import (
     AIParseResponse,
     AISummaryResponse,
 )
+from .ai_agent import run_ledger_agent
 from .ai_service import AIService, AIServiceError, _validated_base_url, decrypt_api_key, encrypt_api_key
 from .auth import current_user
 from .config import get_settings
 from .db import SessionLocal, get_db
-from .models import AIConfig, AIReport, Category, PaymentMethod, Transaction, User
+from .models import AIConfig, AIConversation, AIConversationMessage, AIReport, Category, PaymentMethod, Transaction, User
 from .partners import (
     _append_entry,
     _owned_partner,
@@ -177,6 +182,39 @@ def put_ai_config(payload: AIConfigUpdate, request: Request, db: Session = Depen
     return _config_response(db, user.id)
 
 
+@router.post("/config/swap", response_model=AIConfigRead)
+def swap_ai_channels(request: Request, db: Session = Depends(get_db)):
+    """Make the fallback channel primary and vice versa, keys included.
+
+    A fallback field left blank inherits the primary value at request time,
+    so those gaps are filled in before the swap: the new primary is exactly
+    the channel that was answering as fallback.
+    """
+
+    user = _user(request, db)
+    try:
+        row = db.scalar(select(AIConfig).where(AIConfig.user_id == user.id))
+    except SQLAlchemyError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "AI configuration storage is unavailable") from exc
+    if row is None or not row.fallback_model:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "备用通道还没有配置模型，无法交换。")
+    primary = (row.base_url, row.model, row.encrypted_api_key, row.api_format)
+    fallback = (
+        row.fallback_base_url or row.base_url,
+        row.fallback_model,
+        row.encrypted_fallback_api_key or row.encrypted_api_key,
+        row.fallback_api_format or row.api_format,
+    )
+    row.base_url, row.model, row.encrypted_api_key, row.api_format = fallback
+    row.fallback_base_url, row.fallback_model, row.encrypted_fallback_api_key, row.fallback_api_format = primary
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "AI configuration could not be saved") from exc
+    return _config_response(db, user.id)
+
+
 @router.delete("/config", status_code=status.HTTP_204_NO_CONTENT)
 def delete_ai_config(request: Request, db: Session = Depends(get_db)):
     user = _user(request, db)
@@ -224,7 +262,7 @@ def _sse_events(run: Callable[[Callable[[dict], None]], AIParseResponse]) -> Ite
     def worker() -> None:
         try:
             result = run(events.put)
-            events.put({"type": "result", "data": result.model_dump(mode="json")})
+            events.put({"type": "result", "data": result if isinstance(result, dict) else result.model_dump(mode="json")})
         except AIServiceError as exc:
             events.put({"type": "error", "status": 503, "detail": _ai_unavailable_message(exc)})
         except Exception:
@@ -255,6 +293,9 @@ def parse_natural_language_stream(payload: AIParseRequest, request: Request, db:
     conversation = [item.model_dump() for item in payload.conversation]
 
     def run(emit: Callable[[dict], None]) -> AIParseResponse:
+        # Questions and report requests belong to the transactions page; the
+        # sentence is still parsed, the client just shows a pointer there.
+        emit({"type": "intent", "intent": detect_intent(payload.text, any(item["role"] == "assistant" for item in conversation))})
         # The request-scoped session may be closed before the stream ends.
         with SessionLocal() as session:
             return service.parse(session, user_id, payload.text, conversation, payload.reference_time, payload.mode, on_event=emit)
@@ -271,6 +312,47 @@ def _partner_exists(db: Session, user_id: int, partner_id: int) -> bool:
         return validate_partner_reference(db, user_id, partner_id) is not None
     except HTTPException:
         return False
+
+
+def _calibration_draft(db: Session, user_id: int, draft: AIParsedTransaction) -> AIParsedTransaction:
+    """Turn a balance report into the income/expense entry that explains it.
+
+    The difference is taken against the account row locked right now, so a
+    stale card (balances moved since parsing) still calibrates correctly.
+    """
+
+    if draft.payment_method_id is None or draft.account_balance_cents is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "余额校准需要账户和当前余额")
+    method = _owned_method(db, user_id, draft.payment_method_id, lock=True)
+    stored = int(method.current_balance_cents or 0)
+    delta = int(draft.account_balance_cents) - stored
+    if delta == 0:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "账户余额与系统记录一致，无需校准")
+    # On a liability account the balance is debt: more debt is an expense.
+    liability = getattr(method, "account_role", "cash") == "liability"
+    direction = ("expense" if delta > 0 else "income") if liability else ("income" if delta > 0 else "expense")
+    category_id = draft.category_id
+    if category_id is None:
+        fallback_name = "其他收入" if direction == "income" else "其他支出"
+        category_id = db.scalar(
+            select(Category.id).where(Category.user_id == user_id, Category.name == fallback_name, Category.is_active.is_(True))
+        )
+    if category_id is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "余额校准需要选择一个分类")
+    label = "欠款" if liability else "余额"
+    notes = draft.notes or f"{label}校准：系统 {stored / 100:.2f} → 实际 {draft.account_balance_cents / 100:.2f}"
+    return draft.model_copy(
+        update={
+            "kind": "cashflow",
+            "direction": direction,
+            "amount_cents": abs(delta),
+            "category_id": category_id,
+            "transfer_payment_method_id": None,
+            "partner_id": None,
+            "partner_name": None,
+            "notes": notes,
+        }
+    )
 
 
 def _cash_draft_dictionaries(
@@ -337,6 +419,8 @@ def _ai_transaction(
 def confirm_ai_draft(payload: AIConfirmRequest, request: Request, db: Session = Depends(get_db)):
     user = _user(request, db)
     draft = payload.draft
+    if draft.kind == "balance_check":
+        draft = _calibration_draft(db, user.id, draft)
     mode = payload.mode or ("combined" if payload.partner_ledger_type or draft.partner_ledger_type else "cash")
     ledger_type = payload.partner_ledger_type or draft.partner_ledger_type
     ledger_amount = payload.partner_ledger_amount_cents
@@ -497,6 +581,8 @@ def confirm_ai_drafts(payload: AIBatchConfirmRequest, request: Request, db: Sess
             ).all()
         for index, draft in enumerate(payload.drafts, start=1):
             try:
+                if draft.kind == "balance_check":
+                    draft = _calibration_draft(db, user.id, draft)
                 category, method, transfer_method = _cash_draft_dictionaries(db, user.id, draft)
                 partner = resolve_partner_reference(db, user.id, draft.partner_id, draft.partner_name) if (draft.partner_id or draft.partner_name) else None
             except HTTPException as exc:
@@ -582,12 +668,13 @@ def chat_about_finances(payload: AIChatRequest, request: Request, db: Session = 
     user = _user(request, db)
     conversation = [item.model_dump() for item in payload.conversation]
     has_context = any(item["role"] == "assistant" for item in conversation)
-    intent = detect_intent(payload.text, has_context)
+    intent = payload.intent or detect_intent(payload.text, has_context)
     if payload.period is not None and intent == "bookkeeping":
         # An explicit period from a quick action always means a question.
         intent = "query"
     if intent == "bookkeeping":
         return AIChatResponse(intent="bookkeeping")
+    scope = {key: getattr(payload, key) for key in ("payment_method_id", "category_id", "partner_id", "direction") if getattr(payload, key) is not None}
     if payload.period is not None:
         spec = _resolve_period_or_422(payload.period, payload.start_date, payload.end_date)
     else:
@@ -603,7 +690,7 @@ def chat_about_finances(payload: AIChatRequest, request: Request, db: Session = 
                         break
         if spec is None:
             spec = resolve_period("month", today=today)
-    summary = summarize_period(db, user.id, spec)
+    summary = summarize_period(db, user.id, spec, scope=scope or None)
     try:
         content, source, warning, model_name = service.chat_reply(db, user.id, payload.text, conversation, summary, intent)
     except AIServiceError as exc:
@@ -634,12 +721,222 @@ def chat_about_finances(payload: AIChatRequest, request: Request, db: Session = 
         intent=intent,
         reply=content,
         period=_period_info(spec, summary),
+        scope=summary.get("scope") or {},
         summary=summary,
         report_id=report_id,
         source=source,
         model=model_name if source == "model" else None,
         warning=warning,
     )
+
+
+def _chat_period(payload: AIChatRequest, conversation: list[dict[str, str]]) -> PeriodSpec:
+    if payload.period is not None:
+        return _resolve_period_or_422(payload.period, payload.start_date, payload.end_date)
+    today = to_business(payload.reference_time).date() if payload.reference_time else business_today()
+    spec = parse_period_text(payload.text, today)
+    if spec is None:
+        for item in reversed(conversation):
+            if item["role"] == "user":
+                spec = parse_period_text(item["content"], today)
+                if spec is not None:
+                    break
+    return spec or resolve_period("month", today=today)
+
+
+@router.post("/ask")
+def ask_ledger(payload: AIChatRequest, request: Request, db: Session = Depends(get_db)):
+    """Answer a ledger question with a tool-using assistant, streaming progress.
+
+    The model decides which read-only query tools to call; each call is
+    reported as a ``tool``/``tool_result`` event and the stream ends with a
+    ``result`` event carrying the answer (and ``report_id`` for reports).
+    """
+
+    user_id = _user(request, db).id
+    intent = "report" if payload.intent == "report" else "query"
+    conversation_id = payload.conversation_id
+    if conversation_id is not None:
+        thread = db.scalar(select(AIConversation).where(AIConversation.id == conversation_id, AIConversation.user_id == user_id))
+        if thread is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")
+        stored = db.scalars(
+            select(AIConversationMessage).where(AIConversationMessage.conversation_id == conversation_id).order_by(AIConversationMessage.id.desc()).limit(12)
+        ).all()
+        conversation = [{"role": item.role, "content": item.content} for item in reversed(stored)]
+    else:
+        conversation = [item.model_dump() for item in payload.conversation]
+
+    def run(emit: Callable[[dict], None]) -> dict:
+        with SessionLocal() as session:
+            result = run_ledger_agent(service, session, user_id, payload.text, conversation, intent, emit)
+            content, source, warning, model_name, steps = result.content[:100_000], result.source, result.warning, result.model, result.steps
+            spec = result.period or parse_period_text(payload.text) or resolve_period("month")
+            summary = summarize_period(session, user_id, spec)
+            report_id = None
+            if intent == "report" and payload.save_history:
+                start = spec.start or first_transaction_date(session, user_id) or spec.end
+                report = AIReport(
+                    user_id=user_id,
+                    period=spec.kind,
+                    start_date=_date_start(start),
+                    end_date=_date_start(spec.end),
+                    request_summary=json.dumps(summary, ensure_ascii=False)[:200_000],
+                    response_text=content,
+                    source=source,
+                    model=model_name if source == "model" else None,
+                )
+                session.add(report)
+                try:
+                    session.commit()
+                    session.refresh(report)
+                    report_id = report.id
+                except SQLAlchemyError:
+                    session.rollback()
+                    warning = warning or "报告已生成，但历史记录暂不可用。"
+            period_label = _period_info(spec, summary).label if intent == "report" else None
+            thread_id, message_id = _store_turn(session, user_id, conversation_id, payload.text, content, steps, result.proposals, report_id, period_label, warning)
+            return {
+                "intent": intent,
+                "reply": content,
+                "period": _period_info(spec, summary).model_dump(mode="json"),
+                "scope": {},
+                "report_id": report_id,
+                "source": source,
+                "model": model_name if source == "model" else None,
+                "warning": warning,
+                "steps": steps,
+                "proposals": result.proposals,
+                "conversation_id": thread_id,
+                "message_id": message_id,
+            }
+
+    return StreamingResponse(
+        _sse_events(run),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _store_turn(
+    session: Session,
+    user_id: int,
+    conversation_id: int | None,
+    question: str,
+    answer: str,
+    steps: list[dict],
+    proposals: list[dict],
+    report_id: int | None,
+    period_label: str | None,
+    warning: str | None,
+) -> tuple[int | None, int | None]:
+    """Append a question/answer pair to the conversation (creating it on first use)."""
+
+    try:
+        thread = session.scalar(select(AIConversation).where(AIConversation.id == conversation_id, AIConversation.user_id == user_id)) if conversation_id else None
+        if thread is None:
+            thread = AIConversation(user_id=user_id, title=" ".join(question.split())[:60] or "新对话")
+            session.add(thread)
+            session.flush()
+        session.add(AIConversationMessage(conversation_id=thread.id, user_id=user_id, role="user", content=question[:MAX_STORED_CHARS]))
+        reply = AIConversationMessage(
+            conversation_id=thread.id,
+            user_id=user_id,
+            role="assistant",
+            content=answer[:MAX_STORED_CHARS],
+            steps=steps or None,
+            proposals=proposals or None,
+            report_id=report_id,
+            period_label=period_label,
+            warning=warning,
+        )
+        session.add(reply)
+        thread.updated_at = now_utc()
+        session.commit()
+        return thread.id, reply.id
+    except SQLAlchemyError:
+        session.rollback()
+        logger.exception("AI conversation could not be stored")
+        return None, None
+
+
+MAX_STORED_CHARS = 100_000
+
+
+def _message_payload(item: AIConversationMessage) -> dict:
+    return {
+        "id": item.id,
+        "role": item.role,
+        "content": item.content,
+        "steps": item.steps or [],
+        "proposals": item.proposals or [],
+        "report_id": item.report_id,
+        "period": item.period_label,
+        "warning": item.warning,
+        "created_at": item.created_at,
+    }
+
+
+def _owned_conversation(db: Session, user_id: int, conversation_id: int) -> AIConversation:
+    thread = db.scalar(select(AIConversation).where(AIConversation.id == conversation_id, AIConversation.user_id == user_id))
+    if thread is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")
+    return thread
+
+
+@router.get("/conversations", response_model=list[AIConversationSummary])
+def list_conversations(request: Request, db: Session = Depends(get_db), limit: int = Query(default=30, ge=1, le=100)):
+    user = _user(request, db)
+    counts = (
+        select(AIConversationMessage.conversation_id, func.count(AIConversationMessage.id).label("n"))
+        .where(AIConversationMessage.user_id == user.id)
+        .group_by(AIConversationMessage.conversation_id)
+        .subquery()
+    )
+    rows = db.execute(
+        select(AIConversation, func.coalesce(counts.c.n, 0))
+        .outerjoin(counts, counts.c.conversation_id == AIConversation.id)
+        .where(AIConversation.user_id == user.id)
+        .order_by(AIConversation.updated_at.desc(), AIConversation.id.desc())
+        .limit(limit)
+    ).all()
+    return [AIConversationSummary(id=thread.id, title=thread.title, message_count=int(count), updated_at=thread.updated_at) for thread, count in rows]
+
+
+@router.get("/conversations/{conversation_id}", response_model=AIConversationRead)
+def get_conversation(conversation_id: int, request: Request, db: Session = Depends(get_db)):
+    user = _user(request, db)
+    thread = _owned_conversation(db, user.id, conversation_id)
+    messages = db.scalars(select(AIConversationMessage).where(AIConversationMessage.conversation_id == thread.id).order_by(AIConversationMessage.id)).all()
+    return AIConversationRead(id=thread.id, title=thread.title, updated_at=thread.updated_at, messages=[_message_payload(item) for item in messages])
+
+
+@router.delete("/conversations/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_conversation(conversation_id: int, request: Request, db: Session = Depends(get_db)):
+    user = _user(request, db)
+    thread = _owned_conversation(db, user.id, conversation_id)
+    db.execute(delete(AIConversationMessage).where(AIConversationMessage.conversation_id == thread.id))
+    db.delete(thread)
+    db.commit()
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/proposals/{index}", response_model=dict)
+def set_proposal_status(conversation_id: int, message_id: int, index: int, payload: AIProposalStatus, request: Request, db: Session = Depends(get_db)):
+    """Record what the user did with a change proposal (the write itself goes
+    through the ordinary transaction endpoints)."""
+
+    user = _user(request, db)
+    _owned_conversation(db, user.id, conversation_id)
+    message = db.scalar(select(AIConversationMessage).where(AIConversationMessage.id == message_id, AIConversationMessage.conversation_id == conversation_id))
+    if message is None or not message.proposals or not (0 <= index < len(message.proposals)):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Proposal not found")
+    proposals = [dict(item) for item in message.proposals]
+    proposals[index]["status"] = payload.status
+    if payload.detail:
+        proposals[index]["detail"] = payload.detail
+    message.proposals = proposals
+    db.commit()
+    return {"proposals": proposals}
 
 
 def _date_start(value: date) -> datetime:

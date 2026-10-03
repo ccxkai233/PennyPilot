@@ -233,6 +233,10 @@ AI 配置使用 `GET/PUT (或 PATCH) /api/ai/config`，API Key 以 Fernet 密文
 `POST /api/ai/confirm-batch`（`confirm: true` + `drafts`，最多 10 笔）在同一事务中写入，任何一笔校验失败则全部不入账；
 批量确认只支持现金收支和转账，往来未结算余额仍需单笔确认。
 
+报告某个资金账户的实际余额（“支付宝现在余额 2345.67”“信用卡目前欠款 3000”）会解析成 `kind=balance_check` 的余额校准草稿，
+带 `account_balance_cents` 以及后端算出的 `account_balance_expected_cents` / `account_balance_delta_cents`；确认时后端锁定账户行重新计算差额，
+生成一笔收入或支出流水（分类默认“其他收入 / 其他支出”，备注写明系统余额和实际余额），负债账户的欠款增加记为支出。余额一致时拒绝确认。
+
 主通道和备用通道各有一个接口格式（`api_format` / `fallback_api_format`，也可用环境变量 `PENNYPILOT_AI_API_FORMAT`、`PENNYPILOT_AI_FALLBACK_API_FORMAT` 设默认值），在设置页三选一：
 
 | 格式 | 请求路径 | 说明 |
@@ -256,9 +260,27 @@ AI 配置使用 `GET/PUT (或 PATCH) /api/ai/config`，API Key 以 Fernet 密文
 
 `GET /api/ai/summary?period=month|year|all|day|week|custom` 返回按北京日期聚合的收支数据（总额、分类、
 每日/每月桶、上一周期对比、大额交易），财务分析页的本月图表直接使用该接口，不会调用模型。
-`POST /api/ai/chat` 是对话式账本助手：先用本地规则判断意图，记账句子返回 `intent=bookkeeping` 让前端
-继续走 parse/confirm 流程；询问“本月/本年/全部收支怎么样”会返回基于聚合数据的回答，要求“生成收支报告”
-时会生成报告并保存到分析历史（`report_id`）。模型只接收聚合数字，未配置模型时用本地文本回答。
+`POST /api/ai/ask` 是收支记录页提问栏使用的工具型账本助手（SSE）：模型拿到四个只读工具——`summarize_period`（周期汇总，可按账户/分类/往来/方向限定）、
+`list_transactions`（按日期、关键词、金额区间查明细，最多 100 条）、`list_accounts`（账户余额）、`list_partners`（往来未结算余额）——自行决定调用哪些，
+每次调用以 `tool`/`tool_result` 事件推送给前端显示，最多 6 轮，最后以 `result` 事件返回答案（报告会保存并带 `report_id`，
+归档周期取模型第一次汇总所用的时间段）。提示词只包含三部分：当前北京时间、工具调用方法（含账户/分类/往来单位的 id 对照表）和约束；
+页面筛选不会随问题发送，模型自行决定查询范围；“生成报告”按钮会把当前筛选写成明确的问题（如“生成 2026-10-01 至 2026-10-03 的收支报告，只看 支付宝 账户”）。
+
+改账也走这个助手：`propose_update` / `propose_void` / `propose_create` 三个工具只生成方案（修改前后的对照、原因），随 `result` 事件的 `proposals` 返回，
+前端以卡片展示，用户点“确认执行”后才通过普通的流水接口（`PATCH /api/transactions/{id}`、`POST /api/transactions/{id}/void`、`POST /api/transactions`）写入，
+方案状态（已执行 / 已忽略 / 失败）记录在对话消息里（`POST /api/ai/conversations/{cid}/messages/{mid}/proposals/{index}`）。
+
+问答按对话保存：`/api/ai/ask` 接受 `conversation_id`（省略则新建，返回值带 `conversation_id` 和 `message_id`），上下文从服务端已保存的消息中取最近 12 条；
+`GET /api/ai/conversations` 列出历史对话，`GET /api/ai/conversations/{id}` 返回全部消息（含工具步骤和方案），`DELETE` 删除整段对话。前端用 localStorage 记住当前对话，刷新后自动恢复。
+三种接口格式各自用原生的函数调用协议（OpenAI `tools`、Anthropic `tool_use`、Gemini `functionDeclarations`），模型调用均为最高推理强度；
+没有通道可用时退回本地汇总文本。请求体与 `/api/ai/chat` 相同。
+
+`POST /api/ai/chat` 是不带工具的账本问答（保留给旧客户端）：请求体带 `intent`（`query` 或 `report`）和当前筛选
+（`period`/`start_date`/`end_date`、`payment_method_id`、`category_id`、`partner_id`、`direction`），汇总数据只统计筛选范围内的流水，
+响应的 `scope` 给出范围名称；“生成报告”会把报告保存到分析历史（`report_id`）。未传 `intent` 时仍用本地规则判断，记账句子返回
+`intent=bookkeeping`。模型只接收聚合数字，未配置模型时用本地文本回答。问答和报告以最高推理强度调用模型
+（OpenAI 格式 `reasoning_effort=high`、DeepSeek 开启思考、Anthropic `effort=max`、Gemini `thinkingLevel=high`），记账解析保持低强度。
+AI 记账页只做记账：`/api/ai/parse-stream` 会先推送一个 `intent` 事件，前端据此在对话里提示“查账请到收支记录页”。
 
 每日结算接口为 `GET /api/settlements`（支持 `start_date`、`end_date` 和分页）、
 `GET /api/settlements/{YYYY-MM-DD}`、`POST /api/settlements/run` 和
